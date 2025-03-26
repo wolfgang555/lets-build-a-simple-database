@@ -1,5 +1,24 @@
 const std = @import("std");
 
+const MetaCommandResult = enum {
+    META_COMMAND_SUCCESS,
+    META_COMMAND_UNRECOGNIZED_COMMAND,
+};
+
+const PrepareResult = enum {
+    PREPARE_SUCCESS,
+    PREPARE_UNRECOGNIZED_STATEMENT,
+};
+
+const StatementType = enum {
+    STATEMENT_INSERT,
+    STATEMENT_SELECT,
+};
+
+const Statement = struct {
+    type: StatementType,
+};
+
 // 定义 InputBuffer 结构体
 const InputBuffer = struct {
     buffer: ?[]u8,
@@ -79,6 +98,45 @@ fn closeInputBuffer(input_buffer: *InputBuffer, allocator: std.mem.Allocator) vo
     input_buffer.deinit(allocator);
 }
 
+fn doMetaCommand(inputBuffer: *InputBuffer, allocator: std.mem.Allocator) MetaCommandResult {
+    const buffer_content = inputBuffer.buffer.?;
+    if (std.mem.eql(u8, buffer_content, ".exit")) {
+        closeInputBuffer(inputBuffer, allocator);
+        std.process.exit(0);
+    } else {
+        return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
+    }
+}
+
+fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareResult {
+    const buffer_content = inputBuffer.buffer.?;
+    if (std.mem.eql(u8, buffer_content[0..6], "insert")) {
+        statement.*.type = .STATEMENT_INSERT;
+        return .PREPARE_SUCCESS;
+    }
+
+    if (std.mem.eql(u8, buffer_content[0..6], "select")) {
+        statement.*.type = .STATEMENT_SELECT;
+        return .PREPARE_SUCCESS;
+    }
+
+    return .PREPARE_UNRECOGNIZED_STATEMENT;
+}
+
+fn executeStatement(statement: *Statement) !void {
+    switch (statement.type) {
+        .Insert => {
+            std.debug.print("Insert statement\n", .{});
+        },
+        .Select => {
+            std.debug.print("Select statement\n", .{});
+        },
+        .UnrecognizedStatement => {
+            std.debug.print("Unrecognized statement\n", .{});
+        },
+    }
+}
+
 pub fn main() !void {
     // 创建内存分配器
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -97,10 +155,29 @@ pub fn main() !void {
         const buffer_content = input_buffer.buffer.?;
 
         // 检查是否是退出命令
-        if (std.mem.eql(u8, buffer_content, ".exit")) {
-            break;
-        } else {
-            std.debug.print("Unrecognized command '{s}'.\n", .{buffer_content});
+        if (std.mem.eql(u8, buffer_content[0..1], ".")) {
+            switch (doMetaCommand(input_buffer, allocator)) {
+                .META_COMMAND_SUCCESS => {
+                    std.debug.print("Success\n", .{});
+                    continue;
+                },
+                .META_COMMAND_UNRECOGNIZED_COMMAND => {
+                    std.debug.print("Unrecognized command\n", .{});
+                    continue;
+                },
+            }
+        }
+
+        var state = Statement{ .type = .STATEMENT_INSERT };
+        switch (prepareStatement(input_buffer, &state)) {
+            .PREPARE_SUCCESS => {
+                std.debug.print("Success\n", .{});
+                continue;
+            },
+            .PREPARE_UNRECOGNIZED_STATEMENT => {
+                std.debug.print("Unrecognized statement\n", .{});
+                continue;
+            },
         }
     }
 }
