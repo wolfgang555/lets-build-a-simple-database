@@ -1,5 +1,52 @@
 const std = @import("std");
 
+const COLUMN_USERNAME_SIZE = 32;
+const COLUMN_EMAIL_SIZE = 255;
+
+const Row = struct {
+    id: u32,
+    username: [COLUMN_USERNAME_SIZE]u8,
+    email: [COLUMN_EMAIL_SIZE]u8,
+};
+
+// Zig uses compile-time calculations instead of macros
+const ID_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .username = undefined, .email = undefined }, "id")));
+const USERNAME_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .username = undefined, .email = undefined }, "username")));
+const EMAIL_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .username = undefined, .email = undefined }, "email")));
+const ID_OFFSET = 0;
+const USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
+const EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
+const ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+
+const PAGE_SIZE = 4096;
+const TABLE_MAX_PAGES = 100;
+const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+const TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+
+const ExecuteResult = enum {
+    EXECUTE_SUCCESS,
+    EXECUTE_TABLE_FULL,
+};
+
+const Table = struct {
+    num_rows: u32,
+    pages: [TABLE_MAX_PAGES]?[]u8, // Use slice instead of *anyopaque for easier memory management
+
+    // Constructor
+    pub fn init() Table {
+        var table = Table{
+            .num_rows = 0,
+            .pages = undefined,
+        };
+
+        for (&table.pages) |*page| {
+            page.* = null;
+        }
+
+        return table;
+    }
+};
+
 const MetaCommandResult = enum {
     META_COMMAND_SUCCESS,
     META_COMMAND_UNRECOGNIZED_COMMAND,
@@ -7,6 +54,7 @@ const MetaCommandResult = enum {
 
 const PrepareResult = enum {
     PREPARE_SUCCESS,
+    PREPARE_SYNTAX_ERROR,
     PREPARE_UNRECOGNIZED_STATEMENT,
 };
 
@@ -17,20 +65,19 @@ const StatementType = enum {
 
 const Statement = struct {
     type: StatementType,
+    row_to_insert: Row,
 };
 
-// 定义 InputBuffer 结构体
+// InputBuffer structure
 const InputBuffer = struct {
     buffer: ?[]u8,
     buffer_length: usize,
     input_length: isize,
 
-    // 创建新的 InputBuffer 的函数
+    // Create new InputBuffer
     pub fn new(allocator: std.mem.Allocator) !*InputBuffer {
-        // 分配内存
         const input_buffer = try allocator.create(InputBuffer);
 
-        // 初始化字段
         input_buffer.* = InputBuffer{
             .buffer = null,
             .buffer_length = 0,
@@ -40,7 +87,7 @@ const InputBuffer = struct {
         return input_buffer;
     }
 
-    // 释放资源的函数
+    // Free resources
     pub fn deinit(self: *InputBuffer, allocator: std.mem.Allocator) void {
         if (self.buffer) |buf| {
             allocator.free(buf);
@@ -49,21 +96,93 @@ const InputBuffer = struct {
     }
 };
 
-// 打印提示符
+fn printRow(row: *const Row) void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username, row.email }) catch {};
+}
+
+fn serializeRow(source: *const Row, destination: [*]u8) void {
+    const dest = @as([*]u8, destination);
+
+    // Copy id
+    @memcpy(dest[ID_OFFSET .. ID_OFFSET + ID_SIZE], std.mem.asBytes(&source.id));
+
+    // Copy username
+    @memcpy(dest[USERNAME_OFFSET .. USERNAME_OFFSET + USERNAME_SIZE], std.mem.asBytes(&source.username));
+
+    // Copy email
+    @memcpy(dest[EMAIL_OFFSET .. EMAIL_OFFSET + EMAIL_SIZE], std.mem.asBytes(&source.email));
+}
+
+fn deserializeRow(source: [*]u8, destination: *Row) void {
+    const src = @as([*]u8, source);
+
+    // Copy id
+    @memcpy(std.mem.asBytes(&destination.id), src[ID_OFFSET .. ID_OFFSET + ID_SIZE]);
+
+    // Copy username
+    @memcpy(std.mem.asBytes(&destination.username), src[USERNAME_OFFSET .. USERNAME_OFFSET + USERNAME_SIZE]);
+
+    // Copy email
+    @memcpy(std.mem.asBytes(&destination.email), src[EMAIL_OFFSET .. EMAIL_OFFSET + EMAIL_SIZE]);
+}
+
+fn rowSlot(table: *Table, row_num: u32) [*]u8 {
+    const page_num = row_num / ROWS_PER_PAGE;
+
+    // Allocate page if needed
+    if (table.pages[page_num] == null) {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        const page = gpa.allocator().alloc(u8, PAGE_SIZE) catch @panic("Memory allocation failed");
+        table.pages[page_num] = page;
+    }
+
+    // Get the page
+    const page = table.pages[page_num].?.ptr;
+
+    // Calculate row position
+    const row_offset = row_num % ROWS_PER_PAGE;
+    const byte_offset = row_offset * ROW_SIZE;
+
+    // Return pointer to row slot
+    return page + byte_offset;
+}
+
+// Create new table
+fn newTable(allocator: std.mem.Allocator) !*Table {
+    const table = try allocator.create(Table);
+    table.* = Table.init();
+    return table;
+}
+
+// Free table memory
+fn freeTable(table: *Table, allocator: std.mem.Allocator) void {
+    // Free all allocated pages
+    for (table.pages) |page_opt| {
+        if (page_opt) |page| {
+            allocator.free(page);
+        }
+    }
+
+    // Free the table itself
+    allocator.destroy(table);
+}
+
+// Print prompt
 fn printPrompt() void {
     std.debug.print("db > ", .{});
 }
 
-// 读取输入
+// Read input
 fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
     var stdin = std.io.getStdIn().reader();
 
-    // 如果buffer已存在，先释放
+    // Free existing buffer if exists
     if (input_buffer.buffer) |buf| {
         allocator.free(buf);
     }
 
-    // 分配一个初始缓冲区
+    // Allocate initial buffer
     var buffer = try allocator.alloc(u8, 100);
     errdefer allocator.free(buffer);
 
@@ -72,15 +191,12 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
         return error.InputError;
     };
 
-    // 调整缓冲区大小为实际读取的大小
+    // Resize buffer to actual read size
     if (line.len < buffer.len) {
-        // 在新版Zig中，resize返回布尔值，不是可选类型
         const resized = allocator.resize(buffer, line.len);
-        // 如果调整成功
         if (resized) {
-            buffer.len = line.len;
+            buffer = buffer[0..line.len];
         } else {
-            // 如果调整失败，创建一个新的正确大小的缓冲区
             const new_buffer = try allocator.alloc(u8, line.len);
             @memcpy(new_buffer, line);
             allocator.free(buffer);
@@ -93,15 +209,16 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
     input_buffer.input_length = @intCast(buffer.len);
 }
 
-// 关闭输入缓冲区
+// Close input buffer
 fn closeInputBuffer(input_buffer: *InputBuffer, allocator: std.mem.Allocator) void {
     input_buffer.deinit(allocator);
 }
 
-fn doMetaCommand(inputBuffer: *InputBuffer, allocator: std.mem.Allocator) MetaCommandResult {
+fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Allocator) MetaCommandResult {
     const buffer_content = inputBuffer.buffer.?;
     if (std.mem.eql(u8, buffer_content, ".exit")) {
         closeInputBuffer(inputBuffer, allocator);
+        freeTable(table, allocator);
         std.process.exit(0);
     } else {
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -109,75 +226,146 @@ fn doMetaCommand(inputBuffer: *InputBuffer, allocator: std.mem.Allocator) MetaCo
 }
 
 fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareResult {
-    const buffer_content = inputBuffer.buffer.?;
-    if (std.mem.eql(u8, buffer_content[0..6], "insert")) {
-        statement.*.type = .STATEMENT_INSERT;
-        return .PREPARE_SUCCESS;
-    }
+    if (inputBuffer.buffer) |buffer_content| {
+        if (buffer_content.len >= 6 and std.mem.eql(u8, buffer_content[0..6], "insert")) {
+            statement.*.type = .STATEMENT_INSERT;
 
-    if (std.mem.eql(u8, buffer_content[0..6], "select")) {
-        statement.*.type = .STATEMENT_SELECT;
-        return .PREPARE_SUCCESS;
+            var iter = std.mem.tokenizeAny(u8, buffer_content, " ");
+            _ = iter.next(); // skip insert
+
+            const id_str = iter.next() orelse return PrepareResult.PREPARE_SYNTAX_ERROR;
+            statement.row_to_insert.id = std.fmt.parseInt(u32, id_str, 10) catch {
+                return PrepareResult.PREPARE_SYNTAX_ERROR;
+            };
+
+            const username = iter.next() orelse return .PREPARE_SYNTAX_ERROR;
+            if (username.len >= statement.row_to_insert.username.len) {
+                return .PREPARE_SYNTAX_ERROR;
+            }
+
+            @memset(&statement.row_to_insert.username, 0); // Clear the array
+            std.mem.copyForwards(u8, &statement.row_to_insert.username, username);
+
+            // Parse email
+            const email = iter.next() orelse return .PREPARE_SYNTAX_ERROR;
+            if (email.len >= statement.row_to_insert.email.len) {
+                return .PREPARE_SYNTAX_ERROR;
+            }
+            @memset(&statement.row_to_insert.email, 0); // Clear the array
+            std.mem.copyForwards(u8, &statement.row_to_insert.email, email);
+
+            return .PREPARE_SUCCESS;
+        }
+
+        if (buffer_content.len >= 6 and std.mem.eql(u8, buffer_content[0..6], "select")) {
+            statement.*.type = .STATEMENT_SELECT;
+            return .PREPARE_SUCCESS;
+        }
     }
 
     return .PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
-fn executeStatement(statement: *Statement) !void {
+fn executeInsert(statement: *Statement, table: *Table) ExecuteResult {
+    if (table.num_rows >= TABLE_MAX_ROWS) {
+        return ExecuteResult.EXECUTE_TABLE_FULL;
+    }
+
+    const row_to_insert = &statement.row_to_insert;
+    serializeRow(row_to_insert, rowSlot(table, table.num_rows));
+
+    table.num_rows += 1;
+
+    return ExecuteResult.EXECUTE_SUCCESS;
+}
+
+fn executeSelect(_: *Statement, table: *Table) ExecuteResult {
+    var i: u32 = 0;
+    var row = Row{
+        .id = 0,
+        .username = undefined,
+        .email = undefined,
+    };
+
+    while (i < table.num_rows) : (i += 1) {
+        deserializeRow(rowSlot(table, i), &row);
+        printRow(&row);
+    }
+
+    return ExecuteResult.EXECUTE_SUCCESS;
+}
+
+fn executeStatement(statement: *Statement, table: *Table) ExecuteResult {
     switch (statement.type) {
-        .Insert => {
-            std.debug.print("Insert statement\n", .{});
+        .STATEMENT_INSERT => {
+            return executeInsert(statement, table);
         },
-        .Select => {
-            std.debug.print("Select statement\n", .{});
-        },
-        .UnrecognizedStatement => {
-            std.debug.print("Unrecognized statement\n", .{});
+        .STATEMENT_SELECT => {
+            return executeSelect(statement, table);
         },
     }
 }
 
 pub fn main() !void {
-    // 创建内存分配器
+    // Create memory allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
 
-    // 创建输入缓冲区
+    const table = try newTable(allocator);
+    defer freeTable(table, allocator);
+
+    // Create input buffer
     const input_buffer = try InputBuffer.new(allocator);
-    defer closeInputBuffer(input_buffer, allocator);
+    defer input_buffer.deinit(allocator);
 
     while (true) {
         printPrompt();
         try readInput(input_buffer, allocator);
 
-        // 获取buffer的内容
-        const buffer_content = input_buffer.buffer.?;
+        if (input_buffer.buffer) |buffer_content| {
+            // Check if it's a meta command
+            if (buffer_content.len > 0 and buffer_content[0] == '.') {
+                switch (doMetaCommand(input_buffer, table, allocator)) {
+                    .META_COMMAND_SUCCESS => continue,
+                    .META_COMMAND_UNRECOGNIZED_COMMAND => {
+                        std.debug.print("Unrecognized command '{s}'\n", .{buffer_content});
+                        continue;
+                    },
+                }
+            }
 
-        // 检查是否是退出命令
-        if (std.mem.eql(u8, buffer_content[0..1], ".")) {
-            switch (doMetaCommand(input_buffer, allocator)) {
-                .META_COMMAND_SUCCESS => {
-                    std.debug.print("Success\n", .{});
+            // Prepare statement
+            var statement = Statement{
+                .type = .STATEMENT_INSERT,
+                .row_to_insert = Row{
+                    .id = 0,
+                    .username = undefined,
+                    .email = undefined,
+                },
+            };
+
+            switch (prepareStatement(input_buffer, &statement)) {
+                .PREPARE_SUCCESS => {},
+                .PREPARE_SYNTAX_ERROR => {
+                    std.debug.print("Syntax error. Could not parse statement.\n", .{});
                     continue;
                 },
-                .META_COMMAND_UNRECOGNIZED_COMMAND => {
-                    std.debug.print("Unrecognized command\n", .{});
+                .PREPARE_UNRECOGNIZED_STATEMENT => {
+                    std.debug.print("Unrecognized keyword at start of '{s}'\n", .{buffer_content});
                     continue;
                 },
             }
-        }
 
-        var state = Statement{ .type = .STATEMENT_INSERT };
-        switch (prepareStatement(input_buffer, &state)) {
-            .PREPARE_SUCCESS => {
-                std.debug.print("Success\n", .{});
-                continue;
-            },
-            .PREPARE_UNRECOGNIZED_STATEMENT => {
-                std.debug.print("Unrecognized statement\n", .{});
-                continue;
-            },
+            // Execute statement
+            switch (executeStatement(&statement, table)) {
+                .EXECUTE_SUCCESS => {
+                    std.debug.print("Executed.\n", .{});
+                },
+                .EXECUTE_TABLE_FULL => {
+                    std.debug.print("Error: Table full.\n", .{});
+                },
+            }
         }
     }
 }
