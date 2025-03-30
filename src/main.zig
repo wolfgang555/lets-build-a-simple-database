@@ -98,7 +98,22 @@ const InputBuffer = struct {
 
 fn printRow(row: *const Row) void {
     const stdout = std.io.getStdOut().writer();
-    stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username, row.email }) catch {};
+
+    // Find the actual length of the username (stop at first null byte)
+    var username_len: usize = 0;
+    while (username_len < row.username.len and row.username[username_len] != 0) {
+        username_len += 1;
+    }
+
+    // Find the actual length of the email (stop at first null byte)
+    var email_len: usize = 0;
+    while (email_len < row.email.len and row.email[email_len] != 0) {
+        email_len += 1;
+    }
+
+    // Print only the actual content, not the null padding
+    // Add a newline at the end
+    stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
 }
 
 fn serializeRow(source: *const Row, destination: [*]u8) void {
@@ -170,7 +185,8 @@ fn freeTable(table: *Table, allocator: std.mem.Allocator) void {
 
 // Print prompt
 fn printPrompt() void {
-    std.debug.print("db > ", .{});
+    const stdout = std.io.getStdOut().writer();
+    stdout.print("db > ", .{}) catch {};
 }
 
 // Read input
@@ -296,12 +312,22 @@ fn executeSelect(_: *Statement, table: *Table) ExecuteResult {
 }
 
 fn executeStatement(statement: *Statement, table: *Table) ExecuteResult {
+    const stdout = std.io.getStdOut().writer();
+
     switch (statement.type) {
         .STATEMENT_INSERT => {
-            return executeInsert(statement, table);
+            const result = executeInsert(statement, table);
+            if (result == .EXECUTE_SUCCESS) {
+                stdout.print("Executed.\n", .{}) catch {};
+            }
+            return result;
         },
         .STATEMENT_SELECT => {
-            return executeSelect(statement, table);
+            const result = executeSelect(statement, table);
+            if (result == .EXECUTE_SUCCESS) {
+                stdout.print("Executed.\n", .{}) catch {};
+            }
+            return result;
         },
     }
 }
