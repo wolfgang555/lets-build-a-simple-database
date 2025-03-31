@@ -54,8 +54,10 @@ const MetaCommandResult = enum {
 
 const PrepareResult = enum {
     PREPARE_SUCCESS,
+    PREPARE_NEGATIVE_ID,
     PREPARE_SYNTAX_ERROR,
     PREPARE_UNRECOGNIZED_STATEMENT,
+    PREPARE_STRING_TOO_LONG,
 };
 
 const StatementType = enum {
@@ -198,8 +200,8 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
         allocator.free(buf);
     }
 
-    // Allocate initial buffer
-    var buffer = try allocator.alloc(u8, 100);
+    // Allocate initial buffer with enough space for maximum input
+    var buffer = try allocator.alloc(u8, 400);
     errdefer allocator.free(buffer);
 
     const line = try stdin.readUntilDelimiterOrEof(buffer, '\n') orelse {
@@ -250,13 +252,17 @@ fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareRes
             _ = iter.next(); // skip insert
 
             const id_str = iter.next() orelse return PrepareResult.PREPARE_SYNTAX_ERROR;
-            statement.row_to_insert.id = std.fmt.parseInt(u32, id_str, 10) catch {
+            if (id_str.len > 0 and id_str[0] == '-') {
+                return PrepareResult.PREPARE_NEGATIVE_ID;
+            }
+            const id = std.fmt.parseInt(u32, id_str, 10) catch {
                 return PrepareResult.PREPARE_SYNTAX_ERROR;
             };
 
+            statement.row_to_insert.id = id;
             const username = iter.next() orelse return .PREPARE_SYNTAX_ERROR;
-            if (username.len >= statement.row_to_insert.username.len) {
-                return .PREPARE_SYNTAX_ERROR;
+            if (username.len > statement.row_to_insert.username.len) {
+                return .PREPARE_STRING_TOO_LONG;
             }
 
             @memset(&statement.row_to_insert.username, 0); // Clear the array
@@ -264,8 +270,8 @@ fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareRes
 
             // Parse email
             const email = iter.next() orelse return .PREPARE_SYNTAX_ERROR;
-            if (email.len >= statement.row_to_insert.email.len) {
-                return .PREPARE_SYNTAX_ERROR;
+            if (email.len > statement.row_to_insert.email.len) {
+                return .PREPARE_STRING_TOO_LONG;
             }
             @memset(&statement.row_to_insert.email, 0); // Clear the array
             std.mem.copyForwards(u8, &statement.row_to_insert.email, email);
@@ -319,6 +325,8 @@ fn executeStatement(statement: *Statement, table: *Table) ExecuteResult {
             const result = executeInsert(statement, table);
             if (result == .EXECUTE_SUCCESS) {
                 stdout.print("Executed.\n", .{}) catch {};
+            } else if (result == .EXECUTE_TABLE_FULL) {
+                stdout.print("Error: Table full.\n", .{}) catch {};
             }
             return result;
         },
@@ -355,7 +363,8 @@ pub fn main() !void {
                 switch (doMetaCommand(input_buffer, table, allocator)) {
                     .META_COMMAND_SUCCESS => continue,
                     .META_COMMAND_UNRECOGNIZED_COMMAND => {
-                        std.debug.print("Unrecognized command '{s}'\n", .{buffer_content});
+                        const stdout = std.io.getStdOut().writer();
+                        stdout.print("Unrecognized command '{s}'\n", .{buffer_content}) catch {};
                         continue;
                     },
                 }
@@ -373,12 +382,24 @@ pub fn main() !void {
 
             switch (prepareStatement(input_buffer, &statement)) {
                 .PREPARE_SUCCESS => {},
+                .PREPARE_NEGATIVE_ID => {
+                    const stdout = std.io.getStdOut().writer();
+                    stdout.print("ID must be positive.\n", .{}) catch {};
+                    continue;
+                },
                 .PREPARE_SYNTAX_ERROR => {
-                    std.debug.print("Syntax error. Could not parse statement.\n", .{});
+                    const stdout = std.io.getStdOut().writer();
+                    stdout.print("Syntax error. Could not parse statement.\n", .{}) catch {};
                     continue;
                 },
                 .PREPARE_UNRECOGNIZED_STATEMENT => {
-                    std.debug.print("Unrecognized keyword at start of '{s}'\n", .{buffer_content});
+                    const stdout = std.io.getStdOut().writer();
+                    stdout.print("Unrecognized keyword at start of '{s}'\n", .{buffer_content}) catch {};
+                    continue;
+                },
+                .PREPARE_STRING_TOO_LONG => {
+                    const stdout = std.io.getStdOut().writer();
+                    stdout.print("String is too long.\n", .{}) catch {};
                     continue;
                 },
             }
@@ -386,10 +407,10 @@ pub fn main() !void {
             // Execute statement
             switch (executeStatement(&statement, table)) {
                 .EXECUTE_SUCCESS => {
-                    std.debug.print("Executed.\n", .{});
+                    // Success message is already printed in executeStatement
                 },
                 .EXECUTE_TABLE_FULL => {
-                    std.debug.print("Error: Table full.\n", .{});
+                    // Error message is already printed in executeStatement
                 },
             }
         }
