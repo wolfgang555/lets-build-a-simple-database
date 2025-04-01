@@ -5,13 +5,19 @@ const Allocator = std.mem.Allocator;
 
 const COLUMN_USERNAME_SIZE = 32;
 const COLUMN_EMAIL_SIZE = 255;
-const MAGIC_VALID_ROW = 0xDEADBEEF;  // Magic number for valid rows
+const MAGIC_VALID_ROW = 0xDEADBEEF; // Magic number for valid rows
 
 const Row = struct {
     id: u32,
-    magic: u32,  // Magic number to identify valid rows
+    magic: u32, // Magic number to identify valid rows
     username: [COLUMN_USERNAME_SIZE]u8,
     email: [COLUMN_EMAIL_SIZE]u8,
+};
+
+const Cursor = struct {
+    table: *Table,
+    row_num: u32,
+    end_of_table: bool,
 };
 
 // Zig uses compile-time calculations instead of macros
@@ -121,6 +127,26 @@ const InputBuffer = struct {
     }
 };
 
+fn tableStart(table: *Table, allocator: std.mem.Allocator) !*Cursor {
+    const cursor = try allocator.create(Cursor);
+    cursor.* = Cursor{
+        .table = table,
+        .row_num = 0,
+        .end_of_table = table.num_rows == 0,
+    };
+    return cursor;
+}
+
+fn tableEnd(table: *Table, allocator: std.mem.Allocator) !*Cursor {
+    const cursor = try allocator.create(Cursor);
+    cursor.* = Cursor{
+        .table = table,
+        .row_num = @intCast(table.num_rows),
+        .end_of_table = true,
+    };
+    return cursor;
+}
+
 fn printRow(row: *const Row) void {
     const stdout = std.io.getStdOut().writer();
 
@@ -146,7 +172,7 @@ fn serializeRow(source: *const Row, destination: [*]u8) void {
 
     // Copy id
     @memcpy(dest[ID_OFFSET .. ID_OFFSET + ID_SIZE], std.mem.asBytes(&source.id));
-    
+
     // Copy magic
     @memcpy(dest[MAGIC_OFFSET .. MAGIC_OFFSET + MAGIC_SIZE], std.mem.asBytes(&source.magic));
 
@@ -162,7 +188,7 @@ fn deserializeRow(source: [*]u8, destination: *Row) void {
 
     // Copy id
     @memcpy(std.mem.asBytes(&destination.id), src[ID_OFFSET .. ID_OFFSET + ID_SIZE]);
-    
+
     // Copy magic
     @memcpy(std.mem.asBytes(&destination.magic), src[MAGIC_OFFSET .. MAGIC_OFFSET + MAGIC_SIZE]);
 
@@ -173,16 +199,38 @@ fn deserializeRow(source: [*]u8, destination: *Row) void {
     @memcpy(std.mem.asBytes(&destination.email), src[EMAIL_OFFSET .. EMAIL_OFFSET + EMAIL_SIZE]);
 }
 
-fn rowSlot(table: *Table, row_num: u32, allocator: std.mem.Allocator) [*]u8 {
-    const page_num = row_num / ROWS_PER_PAGE;
-    const page = getPage(table.pager, @as(u32, page_num), allocator) catch unreachable;
+fn rowSlot(cursor: *Cursor, allocator: std.mem.Allocator) [*]u8 {
+    const page_num = cursor.row_num / ROWS_PER_PAGE;
+    const page = getPage(cursor.table.pager, @as(u32, page_num), allocator) catch unreachable;
 
     // Calculate row position
-    const row_offset = row_num % ROWS_PER_PAGE;
+    const row_offset = cursor.row_num % ROWS_PER_PAGE;
     const byte_offset = row_offset * ROW_SIZE;
 
     // Return pointer to row slot
     return @as([*]u8, @ptrCast(page.ptr)) + byte_offset;
+}
+
+fn cursorValue(cursor: *Cursor, allocator: std.mem.Allocator) [*]u8 {
+    const row_num = cursor.row_num;
+    const page_num = row_num / ROWS_PER_PAGE;
+    const page = getPage(cursor.table.pager, @as(u32, page_num), allocator) catch unreachable;
+    const row_offset = row_num % ROWS_PER_PAGE;
+    const byte_offset = row_offset * ROW_SIZE;
+
+    return @as([*]u8, @ptrCast(page.ptr)) + byte_offset;
+}
+
+fn cursorAdvance(cursor: *Cursor) void {
+    cursor.row_num += 1;
+    if (cursor.row_num >= cursor.table.num_rows) {
+        cursor.end_of_table = true;
+    }
+}
+
+fn cursorReset(cursor: *Cursor) void {
+    cursor.row_num = 0;
+    cursor.end_of_table = false;
 }
 
 fn pagerOpen(filename: []const u8, allocator: std.mem.Allocator) !*Pager {
@@ -311,7 +359,7 @@ fn pagerFlush(pager: *Pager, page_num: u32, size: usize) !void {
 // Create new table
 fn dbOpen(filename: []const u8, allocator: std.mem.Allocator) !*Table {
     const pager = try pagerOpen(filename, allocator);
-    
+
     // Calculate number of rows - assume only complete rows are stored
     // Only properly inserted rows should be considered (no garbage data)
     var num_rows: u64 = 0;
@@ -321,14 +369,14 @@ fn dbOpen(filename: []const u8, allocator: std.mem.Allocator) !*Table {
             // At least one row exists
             // Each row has a fixed size, so we can calculate the number of rows
             num_rows = pager.file_length / ROW_SIZE;
-            
+
             // Ensure we don't exceed max rows
             if (num_rows > TABLE_MAX_ROWS) {
                 num_rows = TABLE_MAX_ROWS;
             }
         }
     }
-    
+
     const table = try allocator.create(Table);
     table.* = Table.init(pager, num_rows);
     return table;
@@ -372,14 +420,14 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
         input_buffer.buffer = null;
         input_buffer.buffer_length = 0;
         input_buffer.input_length = 0;
-        
+
         if (err == error.EndOfStream) {
             // Handle EOF gracefully - exit the program
             const stdout = std.io.getStdOut().writer();
             stdout.print("\n", .{}) catch {};
             std.process.exit(0);
         }
-        
+
         return err;
     };
 
@@ -390,7 +438,7 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
         input_buffer.buffer = null;
         input_buffer.buffer_length = 0;
         input_buffer.input_length = 0;
-        
+
         const stdout = std.io.getStdOut().writer();
         stdout.print("\n", .{}) catch {};
         std.process.exit(0);
@@ -423,12 +471,12 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
     const buffer_content = inputBuffer.buffer.?;
     if (std.mem.eql(u8, buffer_content, ".exit")) {
         closeInputBuffer(inputBuffer, allocator);
-        
+
         // Make sure to close the database properly - this flushes data to disk
         dbClose(table, allocator) catch |err| {
             std.debug.print("Error closing database: {s}\n", .{@errorName(err)});
         };
-        
+
         std.process.exit(0);
     } else {
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -488,7 +536,12 @@ fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Alloca
     const row_to_insert = &statement.row_to_insert;
     // Add magic number to mark valid rows
     row_to_insert.magic = MAGIC_VALID_ROW;
-    serializeRow(row_to_insert, rowSlot(table, @intCast(table.num_rows), allocator));
+    const cursor = tableEnd(table, allocator) catch {
+        return ExecuteResult.EXECUTE_TABLE_FULL;
+    };
+    defer allocator.destroy(cursor);  // 确保在函数结束时释放 cursor 内存
+
+    serializeRow(row_to_insert, cursorValue(cursor, allocator));
 
     table.num_rows += 1;
 
@@ -505,7 +558,11 @@ fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Alloca
 }
 
 fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) ExecuteResult {
-    var i: u32 = 0;
+    const cursor = tableStart(table, allocator) catch {
+        return ExecuteResult.EXECUTE_TABLE_FULL;
+    };
+    defer allocator.destroy(cursor);  // 确保在函数结束时释放 cursor 内存
+
     var row = Row{
         .id = 0,
         .magic = 0,
@@ -515,17 +572,18 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
 
     // Get stdout for printing
     const stdout = std.io.getStdOut().writer();
-    
+
     // Only show rows up to the tracked num_rows value - this is critical
     // to avoid showing garbage data
-    while (i < table.num_rows) : (i += 1) {
-        deserializeRow(rowSlot(table, i, allocator), &row);
-        
+    while (cursor.row_num < table.num_rows) {
+        deserializeRow(cursorValue(cursor, allocator), &row);
+
         // If we encounter a row without the magic number, skip it
         if (row.magic != MAGIC_VALID_ROW) {
+            cursorAdvance(cursor);
             continue;
         }
-        
+
         // Find the actual length of the username (stop at first null byte)
         var username_len: usize = 0;
         while (username_len < row.username.len and row.username[username_len] != 0) {
@@ -537,13 +595,9 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
         while (email_len < row.email.len and row.email[email_len] != 0) {
             email_len += 1;
         }
-
         // Print only the actual content, not the null padding
-        stdout.print("({d}, {s}, {s})\n", .{ 
-            row.id, 
-            row.username[0..username_len], 
-            row.email[0..email_len] 
-        }) catch {};
+        stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
+        cursorAdvance(cursor);
     }
 
     return ExecuteResult.EXECUTE_SUCCESS;
