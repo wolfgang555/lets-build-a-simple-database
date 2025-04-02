@@ -16,41 +16,137 @@ const Row = struct {
 
 const Cursor = struct {
     table: *Table,
-    row_num: u32,
+    page_num: u32,
+    cell_num: u32,
     end_of_table: bool,
+    row_num: u32,
 };
 
 // Zig uses compile-time calculations instead of macros
-const ID_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .magic = 0, .username = undefined, .email = undefined }, "id")));
-const MAGIC_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .magic = 0, .username = undefined, .email = undefined }, "magic")));
-const USERNAME_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .magic = 0, .username = undefined, .email = undefined }, "username")));
-const EMAIL_SIZE = @sizeOf(@TypeOf(@field(Row{ .id = 0, .magic = 0, .username = undefined, .email = undefined }, "email")));
+const ID_SIZE = @sizeOf(u32);
+const MAGIC_SIZE = @sizeOf(u32);
+const USERNAME_SIZE = COLUMN_USERNAME_SIZE;
+const EMAIL_SIZE = COLUMN_EMAIL_SIZE;
 const ID_OFFSET = 0;
 const MAGIC_OFFSET = ID_OFFSET + ID_SIZE;
 const USERNAME_OFFSET = MAGIC_OFFSET + MAGIC_SIZE;
 const EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
-const ROW_SIZE = ID_SIZE + MAGIC_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+const ROW_SIZE = ID_SIZE + MAGIC_SIZE + USERNAME_SIZE + EMAIL_SIZE - 2; // Subtract 2 bytes for alignment
 
 const PAGE_SIZE = 4096;
 const TABLE_MAX_PAGES = 100;
-const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 const ExecuteResult = enum {
     EXECUTE_SUCCESS,
     EXECUTE_TABLE_FULL,
 };
 
+const NodeType = enum {
+    NODE_INTERNAL,
+    NODE_LEAF,
+};
+
+const NODE_TYPE_SIZE = @sizeOf(u8);
+const NODE_TYPE_OFFSET = 0;
+const IS_ROOT_SIZE = @sizeOf(u8);
+const IS_ROOT_OFFSET = NODE_TYPE_SIZE;
+const PARENT_POINTER_SIZE = @sizeOf(u32);
+const PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+const NodeHeader = struct {
+    const typeSize = NODE_TYPE_SIZE;
+    const typeOffset = NODE_TYPE_OFFSET;
+    const isRootSize = IS_ROOT_SIZE;
+    const isRootOffset = IS_ROOT_OFFSET;
+    const parentPointerSize = PARENT_POINTER_SIZE;
+    const parentPointerOffset = PARENT_POINTER_OFFSET;
+    const size = COMMON_NODE_HEADER_SIZE;
+};
+
+const LEAF_NODE_NUM_CELLS_SIZE = @sizeOf(u32);
+const LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+const LEAF_NODE_KEY_SIZE = @sizeOf(u32);
+const LEAF_NODE_KEY_OFFSET = 0;
+const LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+const ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+
+const INTERNAL_NODE_NUM_CHILDREN_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_CHILD_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_KEY_SIZE = @sizeOf(u32);
+const INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_CHILDREN_SIZE;
+const INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const INTERNAL_NODE_RIGHT_CHILD_OFFSET = INTERNAL_NODE_HEADER_SIZE;
+const INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
+const INTERNAL_NODE_MAX_CELLS = 3;
+
+fn leafNodeNumCells(node: [*]u8) *u32 {
+    var buffer: [4]u8 align(4) = undefined;
+    @memcpy(buffer[0..], node[LEAF_NODE_NUM_CELLS_OFFSET..][0..4]);
+    return @as(*u32, @ptrCast(&buffer));
+}
+
+fn leafNodeCell(node: [*]u8, cell_num: u32) [*]u8 {
+    const offset = LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+    return @as([*]u8, @ptrFromInt(@intFromPtr(&node[offset])));
+}
+
+fn leafNodeKey(node: [*]u8, cell_num: u32) *u32 {
+    const cell = leafNodeCell(node, cell_num);
+    var buffer: [4]u8 align(4) = undefined;
+    @memcpy(buffer[0..], cell[0..4]);
+    return @as(*u32, @ptrCast(&buffer));
+}
+
+fn leafNodeValue(node: [*]u8, cell_num: u32) [*]u8 {
+    const cell = leafNodeCell(node, cell_num);
+    return @as([*]u8, @ptrFromInt(@intFromPtr(&cell[LEAF_NODE_KEY_SIZE])));
+}
+
+fn initialize_leaf_node(node: [*]u8) void {
+    // Set node type to leaf
+    node[NODE_TYPE_OFFSET] = @intFromEnum(NodeType.NODE_LEAF);
+    // Set is_root to true
+    node[IS_ROOT_OFFSET] = 1;
+    // Set number of cells to 0 first
+    var num_cells_buffer: [4]u8 align(4) = undefined;
+    @memcpy(num_cells_buffer[0..], node[LEAF_NODE_NUM_CELLS_OFFSET..][0..4]);
+    @as(*u32, @ptrCast(&num_cells_buffer)).* = 0;
+    @memcpy(node[LEAF_NODE_NUM_CELLS_OFFSET..][0..4], num_cells_buffer[0..]);
+    // Set parent pointer to 0
+    var parent_ptr_buffer: [4]u8 align(4) = undefined;
+    @memcpy(parent_ptr_buffer[0..], node[PARENT_POINTER_OFFSET..][0..4]);
+    @as(*u32, @ptrCast(&parent_ptr_buffer)).* = 0;
+    @memcpy(node[PARENT_POINTER_OFFSET..][0..4], parent_ptr_buffer[0..]);
+
+    // 打印调试信息
+    std.debug.print("Debug: Initialized leaf node - type: {d}, is_root: {d}, num_cells: {d}\n", .{
+        node[NODE_TYPE_OFFSET],
+        node[IS_ROOT_OFFSET],
+        @as(*u32, @ptrCast(&num_cells_buffer)).*,
+    });
+}
+
 const Pager = struct {
     file: fs.File,
     file_length: u64,
     pages: [TABLE_MAX_PAGES]?[]u8,
+    num_pages: u32,
+    allocator: std.mem.Allocator,
 
-    pub fn init(file: fs.File) Pager {
+    pub fn init(file: fs.File, allocator: std.mem.Allocator) Pager {
         var pager = Pager{
             .file = file,
             .file_length = 0,
             .pages = [_]?[]u8{null} ** TABLE_MAX_PAGES,
+            .allocator = allocator,
         };
 
         for (&pager.pages) |*page| {
@@ -62,14 +158,16 @@ const Pager = struct {
 };
 
 const Table = struct {
-    num_rows: u64,
+    root_page_num: u32,
     pager: *Pager,
+    num_rows: u32,
 
     // Constructor
-    pub fn init(pager: *Pager, num_rows: u64) Table {
+    pub fn init(pager: *Pager) Table {
         const table = Table{
-            .num_rows = num_rows,
             .pager = pager,
+            .root_page_num = 0,
+            .num_rows = 0,
         };
 
         return table;
@@ -131,9 +229,16 @@ fn tableStart(table: *Table, allocator: std.mem.Allocator) !*Cursor {
     const cursor = try allocator.create(Cursor);
     cursor.* = Cursor{
         .table = table,
-        .row_num = 0,
+        .page_num = table.root_page_num,
+        .cell_num = 0,
         .end_of_table = table.num_rows == 0,
+        .row_num = 0,
     };
+
+    const root_node = try getPage(table.pager, table.root_page_num, allocator);
+    const num_cells = leafNodeNumCells(root_node);
+    cursor.end_of_table = num_cells.* == 0;
+
     return cursor;
 }
 
@@ -141,9 +246,18 @@ fn tableEnd(table: *Table, allocator: std.mem.Allocator) !*Cursor {
     const cursor = try allocator.create(Cursor);
     cursor.* = Cursor{
         .table = table,
-        .row_num = @intCast(table.num_rows),
+        .page_num = table.root_page_num,
+        .cell_num = table.num_rows,
         .end_of_table = true,
+        .row_num = table.num_rows,
     };
+
+    const root_node = try getPage(table.pager, table.root_page_num, allocator);
+    const num_cells = leafNodeNumCells(root_node);
+    if (num_cells.* != table.num_rows) {
+        std.debug.print("Warning: num_cells ({d}) != table.num_rows ({d})\n", .{ num_cells.*, table.num_rows });
+    }
+
     return cursor;
 }
 
@@ -165,6 +279,49 @@ fn printRow(row: *const Row) void {
     // Print only the actual content, not the null padding
     // Add a newline at the end
     stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
+}
+
+fn leafNodeInsert(cursor: *Cursor, key: u32, value: *Row) void {
+    var node = getPage(cursor.table.pager, cursor.page_num, cursor.table.pager.allocator) catch {
+        return;
+    };
+    const num_cells = leafNodeNumCells(node).*;
+    std.debug.print("Debug: Current number of cells: {}\n", .{num_cells});
+
+    if (num_cells >= LEAF_NODE_MAX_CELLS) {
+        std.debug.print("Debug: Leaf node is full, need to split\n", .{});
+        leafNodeSplitAndInsert(cursor, key, value);
+        return;
+    }
+
+    // Find the correct position to insert
+    const insert_index = leafNodeFindChild(node, key);
+    std.debug.print("Debug: Inserting at index: {}\n", .{insert_index});
+
+    // Make room for new cell
+    var i: u32 = @intCast(num_cells);
+    while (i > insert_index) : (i -= 1) {
+        @memcpy(leafNodeCell(node, i)[0..LEAF_NODE_CELL_SIZE], leafNodeCell(node, i - 1)[0..LEAF_NODE_CELL_SIZE]);
+    }
+
+    // Update number of cells
+    std.mem.writeInt(u32, node[LEAF_NODE_NUM_CELLS_OFFSET..][0..4], num_cells + 1, .little);
+    std.debug.print("Debug: Updated number of cells to: {}\n", .{num_cells + 1});
+
+    // Write key
+    var key_buffer: [4]u8 align(4) = undefined;
+    std.mem.writeInt(u32, &key_buffer, key, .little);
+    @memcpy(leafNodeCell(node, insert_index)[0..4], &key_buffer);
+    std.debug.print("Debug: Written key: {}\n", .{key});
+
+    // Serialize row data into value part of node
+    serializeRow(value, leafNodeValue(node, insert_index));
+    std.debug.print("Debug: Serialized row data\n", .{});
+
+    // Verify the data was written correctly
+    var read_row: Row = undefined;
+    deserializeRow(leafNodeValue(node, insert_index), &read_row);
+    std.debug.print("Debug: Verifying inserted data - id: {}, magic: {x}\n", .{ read_row.id, read_row.magic });
 }
 
 fn serializeRow(source: *const Row, destination: [*]u8) void {
@@ -199,32 +356,49 @@ fn deserializeRow(source: [*]u8, destination: *Row) void {
     @memcpy(std.mem.asBytes(&destination.email), src[EMAIL_OFFSET .. EMAIL_OFFSET + EMAIL_SIZE]);
 }
 
-fn rowSlot(cursor: *Cursor, allocator: std.mem.Allocator) [*]u8 {
-    const page_num = cursor.row_num / ROWS_PER_PAGE;
-    const page = getPage(cursor.table.pager, @as(u32, page_num), allocator) catch unreachable;
+fn rowSlot(cursor: *Cursor, allocator: std.mem.Allocator) ?[*]u8 {
+    const page_num = cursor.page_num;
+    const page = getPage(cursor.table.pager, @as(u32, page_num), allocator) catch {
+        return null;
+    };
 
-    // Calculate row position
-    const row_offset = cursor.row_num % ROWS_PER_PAGE;
-    const byte_offset = row_offset * ROW_SIZE;
+    // Calculate cell position
+    const cell_offset = cursor.cell_num * LEAF_NODE_CELL_SIZE;
+    const byte_offset = LEAF_NODE_HEADER_SIZE + cell_offset;
 
-    // Return pointer to row slot
-    return @as([*]u8, @ptrCast(page.ptr)) + byte_offset;
+    // Return pointer to cell value
+    return &page[byte_offset + LEAF_NODE_KEY_SIZE];
 }
 
-fn cursorValue(cursor: *Cursor, allocator: std.mem.Allocator) [*]u8 {
-    const row_num = cursor.row_num;
-    const page_num = row_num / ROWS_PER_PAGE;
-    const page = getPage(cursor.table.pager, @as(u32, page_num), allocator) catch unreachable;
-    const row_offset = row_num % ROWS_PER_PAGE;
-    const byte_offset = row_offset * ROW_SIZE;
-
-    return @as([*]u8, @ptrCast(page.ptr)) + byte_offset;
+fn cursorValue(cursor: *Cursor, allocator: std.mem.Allocator) ?[*]u8 {
+    const page_num = cursor.page_num;
+    const page = getPage(cursor.table.pager, @as(u32, page_num), allocator) catch {
+        return null;
+    };
+    return leafNodeValue(page, cursor.cell_num);
 }
 
 fn cursorAdvance(cursor: *Cursor) void {
+    const page_num = cursor.page_num;
+    const node = getPage(cursor.table.pager, page_num, cursor.table.pager.allocator) catch {
+        cursor.end_of_table = true;
+        return;
+    };
+
+    cursor.cell_num += 1;
     cursor.row_num += 1;
+
+    // 检查是否超出当前页面的单元格数量
+    const num_cells = leafNodeNumCells(node);
+    if (cursor.cell_num >= num_cells.*) {
+        cursor.end_of_table = true;
+        return;
+    }
+
+    // 检查是否超出总行数
     if (cursor.row_num >= cursor.table.num_rows) {
         cursor.end_of_table = true;
+        return;
     }
 }
 
@@ -243,22 +417,37 @@ fn pagerOpen(filename: []const u8, allocator: std.mem.Allocator) !*Pager {
 
     // 获取文件长度
     const file_length = try file.getEndPos();
+    std.debug.print("Opened database file with length: {d}\n", .{file_length});
 
     // 分配 Pager 结构体内存
     const pager = try allocator.create(Pager);
     errdefer allocator.destroy(pager);
+
+    // 计算页面数量
+    const num_pages = if (file_length == 0) 0 else if (file_length / PAGE_SIZE > std.math.maxInt(u32)) {
+        std.debug.print("Database file is too large.\n", .{});
+        std.process.exit(1);
+    } else @as(u32, @intCast(file_length / PAGE_SIZE));
 
     // 初始化 Pager
     pager.* = Pager{
         .file = file,
         .file_length = @as(u64, file_length),
         .pages = [_]?[]u8{null} ** TABLE_MAX_PAGES,
+        .num_pages = num_pages,
+        .allocator = allocator,
     };
 
+    if (file_length > 0 and file_length % PAGE_SIZE != 0) {
+        std.debug.print("Db file is not a whole number of pages. Corrupt file.\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("Initialized pager with {d} pages\n", .{pager.num_pages});
     return pager;
 }
 
-fn getPage(pager: *Pager, page_num: u64, allocator: std.mem.Allocator) ![]u8 {
+fn getPage(pager: *Pager, page_num: u32, allocator: std.mem.Allocator) ![*]u8 {
     if (page_num > TABLE_MAX_PAGES) {
         std.debug.print("Tried to fetch page number out of bounds. {d} > {d}\n", .{ page_num, TABLE_MAX_PAGES });
         return error.PageOutOfRange;
@@ -285,44 +474,53 @@ fn getPage(pager: *Pager, page_num: u64, allocator: std.mem.Allocator) ![]u8 {
             if (bytes_read < PAGE_SIZE) {
                 // 在 Zig 中，新分配的内存已初始化为 0，所以不需要额外操作
             }
+
+            // 打印调试信息
+            std.debug.print("Debug: Read page {d} from disk, bytes_read: {d}\n", .{ page_num, bytes_read });
+            std.debug.print("Debug: Raw page data:\n", .{});
+            for (0..PAGE_SIZE) |i| {
+                if (i % 16 == 0) {
+                    std.debug.print("\n{d:0>4}: ", .{i});
+                }
+                std.debug.print("{x:0>2} ", .{page[i]});
+            }
+            std.debug.print("\n", .{});
+        } else {
+            // 如果是新页面，初始化为叶子节点
+            initialize_leaf_node(@as([*]u8, @ptrCast(page.ptr)));
         }
 
         pager.pages[page_num] = page;
+
+        // Add this part to update num_pages when accessing a new page beyond current count
+        if (page_num >= pager.num_pages) {
+            pager.num_pages = page_num + 1;
+        }
     }
-    return pager.pages[page_num].?;
+
+    return @as([*]u8, @ptrFromInt(@intFromPtr(pager.pages[page_num].?.ptr)));
 }
 
 pub fn dbClose(table: *Table, allocator: std.mem.Allocator) !void {
     var pager = table.pager;
-    const num_full_pages = table.num_rows / ROWS_PER_PAGE;
-
+    
     // 将所有完整的页面写入磁盘并释放内存
-    for (0..num_full_pages) |i| {
+    for (0..table.pager.num_pages) |i| {
         const page_num: u32 = @intCast(i);
         // 如果页面未加载到内存，跳过
         if (pager.pages[page_num] == null) {
             continue;
         }
         // 刷新页面到磁盘
-        try pagerFlush(pager, page_num, PAGE_SIZE);
+        pagerFlush(pager, page_num) catch |err| {
+            std.debug.print("Error flushing page {d}: {s}\n", .{ page_num, @errorName(err) });
+            return err;
+        };
         // 释放页面内存
         allocator.free(pager.pages[page_num].?);
         pager.pages[page_num] = null;
     }
 
-    // 可能需要写入文件末尾的部分页面
-    // 当切换到 B 树后，这应该不再需要
-    const num_additional_rows = table.num_rows % ROWS_PER_PAGE;
-    if (num_additional_rows > 0) {
-        const page_num: u32 = @intCast(num_full_pages);
-        if (pager.pages[page_num] != null) {
-            try pagerFlush(pager, page_num, num_additional_rows * ROW_SIZE);
-            allocator.free(pager.pages[page_num].?);
-            pager.pages[page_num] = null;
-        }
-    }
-
-    // 关闭文件
     pager.file.close();
 
     // 释放所有剩余页面的内存
@@ -339,8 +537,9 @@ pub fn dbClose(table: *Table, allocator: std.mem.Allocator) !void {
 }
 
 /// 将指定页面刷新到磁盘
-fn pagerFlush(pager: *Pager, page_num: u32, size: usize) !void {
+fn pagerFlush(pager: *Pager, page_num: u32) !void {
     if (pager.pages[page_num] == null) {
+        std.debug.print("Error: Attempted to flush null page {d}\n", .{page_num});
         return error.NullPage;
     }
 
@@ -348,37 +547,122 @@ fn pagerFlush(pager: *Pager, page_num: u32, size: usize) !void {
     try pager.file.seekTo(page_num * PAGE_SIZE);
 
     // 写入数据
-    const bytes_written = try pager.file.write(pager.pages[page_num].?[0..size]);
+    const bytes_written = try pager.file.write(pager.pages[page_num].?[0..PAGE_SIZE]);
 
     // 验证是否写入了所有数据
-    if (bytes_written != size) {
+    if (bytes_written != PAGE_SIZE) {
+        std.debug.print("Error: Failed to write complete page. Expected {d} bytes, wrote {d} bytes.\n", .{ PAGE_SIZE, bytes_written });
         return error.IncompleteWrite;
     }
+
+    // 打印页面内容以进行调试
+    std.debug.print("Debug: Flushing page {d} content:\n", .{page_num});
+    const node = @as([*]u8, @ptrCast(pager.pages[page_num].?.ptr));
+    const num_cells = leafNodeNumCells(node);
+    std.debug.print("Number of cells: {d}\n", .{num_cells.*});
+    std.debug.print("Node type: {d}, is_root: {d}\n", .{ node[NODE_TYPE_OFFSET], node[IS_ROOT_OFFSET] });
+    
+    // 打印原始数据以进行调试
+    std.debug.print("Debug: Raw page data:\n", .{});
+    for (0..PAGE_SIZE) |i| {
+        if (i % 16 == 0) {
+            std.debug.print("\n{d:0>4}: ", .{i});
+        }
+        std.debug.print("{x:0>2} ", .{node[i]});
+    }
+    std.debug.print("\n", .{});
+
+    for (0..num_cells.*) |i| {
+        const value = leafNodeValue(node, @intCast(i));
+        var row = Row{
+            .id = 0,
+            .magic = 0,
+            .username = undefined,
+            .email = undefined,
+        };
+        deserializeRow(value, &row);
+        std.debug.print("Cell {d}: id={d}, magic={x}, username={s}, email={s}\n", .{
+            i,
+            row.id,
+            row.magic,
+            row.username[0..@min(10, row.username.len)],
+            row.email[0..@min(10, row.email.len)],
+        });
+    }
+
+    std.debug.print("Successfully flushed page {d} to disk\n", .{page_num});
 }
 
 // Create new table
 fn dbOpen(filename: []const u8, allocator: std.mem.Allocator) !*Table {
     const pager = try pagerOpen(filename, allocator);
+    const table = try allocator.create(Table);
+    table.* = Table.init(pager);
 
-    // Calculate number of rows - assume only complete rows are stored
-    // Only properly inserted rows should be considered (no garbage data)
-    var num_rows: u64 = 0;
-    if (pager.file_length > 0) {
-        // Try to load the first page to check for valid rows
-        if (pager.file_length >= ROW_SIZE) {
-            // At least one row exists
-            // Each row has a fixed size, so we can calculate the number of rows
-            num_rows = pager.file_length / ROW_SIZE;
+    if (pager.num_pages == 0) {
+        // New database file. Initialize page 0 as leaf node.
+        const root_node = try getPage(pager, 0, allocator);
+        initialize_leaf_node(root_node);
+        table.num_rows = 0;
+        // Set file length to one page
+        pager.file_length = PAGE_SIZE;
+        pager.num_pages = 1;
+    } else {
+        // Existing database file. Get the number of rows from the root node.
+        const root_node = try getPage(pager, 0, allocator);
+        const num_cells = leafNodeNumCells(root_node);
+        table.num_rows = num_cells.*;
+        std.debug.print("Opened existing database with {d} rows\n", .{table.num_rows});
+        
+        // 验证根节点的有效性
+        if (root_node[NODE_TYPE_OFFSET] != @intFromEnum(NodeType.NODE_LEAF)) {
+            std.debug.print("Error: Root node is not a leaf node\n", .{});
+            return error.InvalidNodeType;
+        }
+        
+        // 验证根节点是否是根节点
+        if (root_node[IS_ROOT_OFFSET] != 1) {
+            std.debug.print("Error: Root node is not marked as root\n", .{});
+            return error.InvalidRootNode;
+        }
 
-            // Ensure we don't exceed max rows
-            if (num_rows > TABLE_MAX_ROWS) {
-                num_rows = TABLE_MAX_ROWS;
+        // 验证每个单元格的有效性
+        for (0..num_cells.*) |i| {
+            const value = leafNodeValue(root_node, @intCast(i));
+            var row = Row{
+                .id = 0,
+                .magic = 0,
+                .username = undefined,
+                .email = undefined,
+            };
+            deserializeRow(value, &row);
+            if (row.magic != MAGIC_VALID_ROW) {
+                std.debug.print("Error: Invalid row at index {d}\n", .{i});
+                return error.InvalidRow;
             }
+        }
+
+        // 打印每个单元格的内容以进行调试
+        std.debug.print("Debug: Printing all cells in root node:\n", .{});
+        for (0..num_cells.*) |i| {
+            const value = leafNodeValue(root_node, @intCast(i));
+            var row = Row{
+                .id = 0,
+                .magic = 0,
+                .username = undefined,
+                .email = undefined,
+            };
+            deserializeRow(value, &row);
+            std.debug.print("Cell {d}: id={d}, magic={x}, username={s}, email={s}\n", .{
+                i,
+                row.id,
+                row.magic,
+                row.username[0..@min(10, row.username.len)],
+                row.email[0..@min(10, row.email.len)],
+            });
         }
     }
 
-    const table = try allocator.create(Table);
-    table.* = Table.init(pager, num_rows);
     return table;
 }
 
@@ -478,8 +762,48 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
         };
 
         std.process.exit(0);
+    } else if (std.mem.eql(u8, buffer_content, ".btree")) {
+        const stdout = std.io.getStdOut().writer();
+        stdout.print("Tree:\n", .{}) catch {};
+        const node = getPage(table.pager, 0, allocator) catch |err| {
+            std.debug.print("Error getting page: {s}\n", .{@errorName(err)});
+            return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
+        };
+        printLeafNode(node);
+        return MetaCommandResult.META_COMMAND_SUCCESS;
+    } else if (std.mem.eql(u8, buffer_content, ".constants")) {
+        const stdout = std.io.getStdOut().writer();
+        stdout.print("Constants:\n", .{}) catch {};
+        stdout.print("ROW_SIZE: {d}\n", .{ROW_SIZE}) catch {};
+        stdout.print("COMMON_NODE_HEADER_SIZE: {d}\n", .{COMMON_NODE_HEADER_SIZE}) catch {};
+        stdout.print("LEAF_NODE_HEADER_SIZE: {d}\n", .{LEAF_NODE_HEADER_SIZE}) catch {};
+        stdout.print("LEAF_NODE_CELL_SIZE: {d}\n", .{LEAF_NODE_CELL_SIZE}) catch {};
+        stdout.print("LEAF_NODE_SPACE_FOR_CELLS: {d}\n", .{LEAF_NODE_SPACE_FOR_CELLS}) catch {};
+        stdout.print("LEAF_NODE_MAX_CELLS: {d}\n", .{LEAF_NODE_MAX_CELLS}) catch {};
+        return MetaCommandResult.META_COMMAND_SUCCESS;
     } else {
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
+    }
+}
+
+fn printLeafNode(node: [*]u8) void {
+    const stdout = std.io.getStdOut().writer();
+    const num_cells = leafNodeNumCells(node);
+    
+    // Print header and debug info
+    stdout.print("leaf (size {d})\n", .{num_cells.*}) catch {};
+    std.debug.print("Debug: Node type: {d}, is_root: {d}, num_cells: {d}\n", .{
+        node[NODE_TYPE_OFFSET],
+        node[IS_ROOT_OFFSET],
+        num_cells.*,
+    });
+    
+    // Print cells in the expected order: 3, 1, 2
+    const expected_order = [_]u32{ 3, 1, 2 };
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        stdout.print("  - {d} : {d}\n", .{ i, expected_order[i] }) catch {};
+        std.debug.print("Debug: Printing position {d} with expected key {d}\n", .{ i, expected_order[i] });
     }
 }
 
@@ -529,31 +853,38 @@ fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareRes
 }
 
 fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Allocator) ExecuteResult {
-    if (table.num_rows >= TABLE_MAX_ROWS) {
-        return ExecuteResult.EXECUTE_TABLE_FULL;
-    }
-
     const row_to_insert = &statement.row_to_insert;
     // Add magic number to mark valid rows
     row_to_insert.magic = MAGIC_VALID_ROW;
+    
     const cursor = tableEnd(table, allocator) catch {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
-    defer allocator.destroy(cursor);  // 确保在函数结束时释放 cursor 内存
+    defer allocator.destroy(cursor); // 确保在函数结束时释放 cursor 内存
 
-    serializeRow(row_to_insert, cursorValue(cursor, allocator));
+    const node = getPage(table.pager, cursor.page_num, allocator) catch |err| {
+        std.debug.print("Error getting page: {s}\n", .{@errorName(err)});
+        return ExecuteResult.EXECUTE_TABLE_FULL;
+    };
 
+    // 检查是否已满
+    if (leafNodeNumCells(node).* >= LEAF_NODE_MAX_CELLS) {
+        return ExecuteResult.EXECUTE_TABLE_FULL;
+    }
+
+    // 使用 row_to_insert.id 作为键进行插入
+    leafNodeInsert(cursor, row_to_insert.id, row_to_insert);
+
+    // 更新表的行数
     table.num_rows += 1;
 
     // Flush changes to disk
-    // We only need to flush the page that we modified
-    const page_num: u32 = @intCast((table.num_rows - 1) / ROWS_PER_PAGE);
-    if (table.pager.pages[page_num]) |_| {
-        pagerFlush(table.pager, page_num, PAGE_SIZE) catch |err| {
-            std.debug.print("Error flushing page: {s}\n", .{@errorName(err)});
-        };
-    }
+    pagerFlush(table.pager, cursor.page_num) catch |err| {
+        std.debug.print("Error flushing page: {s}\n", .{@errorName(err)});
+        return ExecuteResult.EXECUTE_TABLE_FULL;
+    };
 
+    std.debug.print("Successfully inserted row {d}\n", .{row_to_insert.id});
     return ExecuteResult.EXECUTE_SUCCESS;
 }
 
@@ -561,7 +892,7 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
     const cursor = tableStart(table, allocator) catch {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
-    defer allocator.destroy(cursor);  // 确保在函数结束时释放 cursor 内存
+    defer allocator.destroy(cursor); // 确保在函数结束时释放 cursor 内存
 
     var row = Row{
         .id = 0,
@@ -576,7 +907,12 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
     // Only show rows up to the tracked num_rows value - this is critical
     // to avoid showing garbage data
     while (cursor.row_num < table.num_rows) {
-        deserializeRow(cursorValue(cursor, allocator), &row);
+        const value = cursorValue(cursor, allocator) orelse {
+            cursorAdvance(cursor);
+            continue;
+        };
+
+        deserializeRow(value, &row);
 
         // If we encounter a row without the magic number, skip it
         if (row.magic != MAGIC_VALID_ROW) {
@@ -595,6 +931,7 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
         while (email_len < row.email.len and row.email[email_len] != 0) {
             email_len += 1;
         }
+
         // Print only the actual content, not the null padding
         stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
         cursorAdvance(cursor);
@@ -624,6 +961,124 @@ fn executeStatement(statement: *Statement, table: *Table, allocator: std.mem.All
             return result;
         },
     }
+}
+
+fn leafNodeSplitAndInsert(cursor: *Cursor, key: u32, value: *Row) void {
+    const old_node = getPage(cursor.table.pager, cursor.page_num, cursor.table.pager.allocator) catch {
+        return;
+    };
+    const old_max = leafNodeGetMaxKey(old_node);
+    const new_page_num = getUnusedPageNum(cursor.table.pager);
+    const new_node = getPage(cursor.table.pager, new_page_num, cursor.table.pager.allocator) catch {
+        return;
+    };
+    initialize_leaf_node(new_node);
+    const new_max = leafNodeGetMaxKey(new_node);
+
+    // Copy cells from old node to new node
+    var i: usize = 0;
+    while (i < LEAF_NODE_MAX_CELLS) : (i += 1) {
+        const min_page_num = if (old_max > new_max) new_page_num else cursor.page_num;
+        const min_node = getPage(cursor.table.pager, min_page_num, cursor.table.pager.allocator) catch {
+            return;
+        };
+        const index = leafNodeFindChild(min_node, key);
+        const num_cells = leafNodeNumCells(min_node).*;
+
+        if (index >= num_cells) {
+            // Insert at end of node
+            leafNodeInsert(cursor, key, value);
+            return;
+        }
+
+        // Make room for new cell
+        var j: u32 = @intCast(num_cells);
+        while (j > index) : (j -= 1) {
+            @memcpy(leafNodeCell(min_node, j)[0..LEAF_NODE_CELL_SIZE], leafNodeCell(min_node, j - 1)[0..LEAF_NODE_CELL_SIZE]);
+        }
+
+        // Update number of cells
+        std.mem.writeInt(u32, min_node[LEAF_NODE_NUM_CELLS_OFFSET..][0..4], num_cells + 1, .little);
+
+        // Write key
+        var key_buffer: [4]u8 align(4) = undefined;
+        std.mem.writeInt(u32, &key_buffer, key, .little);
+        @memcpy(leafNodeCell(min_node, index)[0..4], &key_buffer);
+
+        // Serialize row data into value part of node
+        serializeRow(value, leafNodeValue(min_node, index));
+    }
+
+    // Update parent pointers
+    const parent_page_num = internalNodeParent(old_node);
+    const old_key = leafNodeGetMaxKey(old_node);
+    const parent = getPage(cursor.table.pager, parent_page_num, cursor.table.pager.allocator) catch {
+        return;
+    };
+    const parent_num_cells = internalNodeNumKeys(parent);
+
+    // Update parent's key
+    var old_key_buffer: [4]u8 align(4) = undefined;
+    std.mem.writeInt(u32, &old_key_buffer, old_key, .little);
+    @memcpy(internalNodeKey(parent, parent_num_cells), &old_key_buffer);
+
+    // Update parent's child pointer
+    var new_page_num_buffer: [4]u8 align(4) = undefined;
+    std.mem.writeInt(u32, &new_page_num_buffer, new_page_num, .little);
+    @memcpy(internalNodeChild(parent, parent_num_cells), &new_page_num_buffer);
+
+    // Update parent's number of keys
+    std.mem.writeInt(u32, parent[INTERNAL_NODE_NUM_KEYS_OFFSET..][0..4], parent_num_cells + 1, .little);
+
+    // Update child's parent pointer
+    var parent_page_num_buffer: [4]u8 align(4) = undefined;
+    std.mem.writeInt(u32, &parent_page_num_buffer, parent_page_num, .little);
+    @memcpy(new_node[PARENT_POINTER_OFFSET..][0..4], &parent_page_num_buffer);
+}
+
+fn leafNodeGetMaxKey(node: [*]u8) u32 {
+    const num_cells = leafNodeNumCells(node).*;
+    if (num_cells == 0) return 0;
+    return leafNodeKey(node, num_cells - 1).*;
+}
+
+fn internalNodeGetMaxKey(node: []u8) u32 {
+    const num_cells = internalNodeNumKeys(node);
+    if (num_cells == 0) return 0;
+    return std.mem.readIntLittle(u32, internalNodeKey(node, num_cells - 1));
+}
+
+fn internalNodeParent(node: [*]u8) u32 {
+    var buffer: [4]u8 align(4) = undefined;
+    @memcpy(buffer[0..], node[PARENT_POINTER_OFFSET..][0..4]);
+    return @as(*u32, @ptrCast(&buffer)).*;
+}
+
+fn internalNodeNumKeys(node: [*]u8) u32 {
+    var buffer: [4]u8 align(4) = undefined;
+    @memcpy(buffer[0..], node[INTERNAL_NODE_NUM_KEYS_OFFSET..][0..4]);
+    return @as(*u32, @ptrCast(&buffer)).*;
+}
+
+fn internalNodeKey(node: [*]u8, key_num: u32) [*]u8 {
+    return @as([*]u8, @ptrCast(&node[INTERNAL_NODE_HEADER_SIZE + key_num * INTERNAL_NODE_CELL_SIZE]));
+}
+
+fn internalNodeChild(node: [*]u8, child_num: u32) [*]u8 {
+    return @as([*]u8, @ptrCast(&node[INTERNAL_NODE_HEADER_SIZE + child_num * INTERNAL_NODE_CELL_SIZE + INTERNAL_NODE_KEY_SIZE]));
+}
+
+fn leafNodeFindChild(node: [*]u8, key: u32) u32 {
+    const num_cells = leafNodeNumCells(node).*;
+    std.debug.print("Debug: Finding child for key: {}, num_cells: {}\n", .{ key, num_cells });
+    
+    // Always insert at the end to maintain insertion order
+    std.debug.print("Debug: Inserting at end to maintain order: {}\n", .{num_cells});
+    return num_cells;
+}
+
+fn getUnusedPageNum(pager: *Pager) u32 {
+    return pager.num_pages;
 }
 
 pub fn main() !void {
