@@ -19,7 +19,6 @@ const Cursor = struct {
     page_num: u32,
     cell_num: u32,
     end_of_table: bool,
-    row_num: u32,
 };
 
 // Zig uses compile-time calculations instead of macros
@@ -160,14 +159,12 @@ const Pager = struct {
 const Table = struct {
     root_page_num: u32,
     pager: *Pager,
-    num_rows: u32,
 
     // Constructor
     pub fn init(pager: *Pager) Table {
         const table = Table{
             .pager = pager,
             .root_page_num = 0,
-            .num_rows = 0,
         };
 
         return table;
@@ -231,8 +228,7 @@ fn tableStart(table: *Table, allocator: std.mem.Allocator) !*Cursor {
         .table = table,
         .page_num = table.root_page_num,
         .cell_num = 0,
-        .end_of_table = table.num_rows == 0,
-        .row_num = 0,
+        .end_of_table = false,
     };
 
     const root_node = try getPage(table.pager, table.root_page_num, allocator);
@@ -247,16 +243,13 @@ fn tableEnd(table: *Table, allocator: std.mem.Allocator) !*Cursor {
     cursor.* = Cursor{
         .table = table,
         .page_num = table.root_page_num,
-        .cell_num = table.num_rows,
+        .cell_num = 0,
         .end_of_table = true,
-        .row_num = table.num_rows,
     };
 
     const root_node = try getPage(table.pager, table.root_page_num, allocator);
     const num_cells = leafNodeNumCells(root_node);
-    if (num_cells.* != table.num_rows) {
-        std.debug.print("Warning: num_cells ({d}) != table.num_rows ({d})\n", .{ num_cells.*, table.num_rows });
-    }
+    cursor.cell_num = num_cells.*;
 
     return cursor;
 }
@@ -386,7 +379,6 @@ fn cursorAdvance(cursor: *Cursor) void {
     };
 
     cursor.cell_num += 1;
-    cursor.row_num += 1;
 
     // 检查是否超出当前页面的单元格数量
     const num_cells = leafNodeNumCells(node);
@@ -394,16 +386,10 @@ fn cursorAdvance(cursor: *Cursor) void {
         cursor.end_of_table = true;
         return;
     }
-
-    // 检查是否超出总行数
-    if (cursor.row_num >= cursor.table.num_rows) {
-        cursor.end_of_table = true;
-        return;
-    }
 }
 
 fn cursorReset(cursor: *Cursor) void {
-    cursor.row_num = 0;
+    cursor.cell_num = 0;
     cursor.end_of_table = false;
 }
 
@@ -603,7 +589,6 @@ fn dbOpen(filename: []const u8, allocator: std.mem.Allocator) !*Table {
         // New database file. Initialize page 0 as leaf node.
         const root_node = try getPage(pager, 0, allocator);
         initialize_leaf_node(root_node);
-        table.num_rows = 0;
         // Set file length to one page
         pager.file_length = PAGE_SIZE;
         pager.num_pages = 1;
@@ -611,8 +596,7 @@ fn dbOpen(filename: []const u8, allocator: std.mem.Allocator) !*Table {
         // Existing database file. Get the number of rows from the root node.
         const root_node = try getPage(pager, 0, allocator);
         const num_cells = leafNodeNumCells(root_node);
-        table.num_rows = num_cells.*;
-        std.debug.print("Opened existing database with {d} rows\n", .{table.num_rows});
+        std.debug.print("Opened existing database with {d} rows\n", .{num_cells.*});
         
         // 验证根节点的有效性
         if (root_node[NODE_TYPE_OFFSET] != @intFromEnum(NodeType.NODE_LEAF)) {
@@ -859,37 +843,29 @@ fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareRes
 
 fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Allocator) ExecuteResult {
     const row_to_insert = &statement.row_to_insert;
-    // Add magic number to mark valid rows
     row_to_insert.magic = MAGIC_VALID_ROW;
     
     const cursor = tableEnd(table, allocator) catch {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
-    defer allocator.destroy(cursor); // 确保在函数结束时释放 cursor 内存
+    defer allocator.destroy(cursor);
 
     const node = getPage(table.pager, cursor.page_num, allocator) catch |err| {
         std.debug.print("Error getting page: {s}\n", .{@errorName(err)});
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
 
-    // 检查是否已满
     if (leafNodeNumCells(node).* >= LEAF_NODE_MAX_CELLS) {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     }
 
-    // 使用 row_to_insert.id 作为键进行插入
     leafNodeInsert(cursor, row_to_insert.id, row_to_insert);
 
-    // 更新表的行数
-    table.num_rows += 1;
-
-    // Flush changes to disk
     pagerFlush(table.pager, cursor.page_num) catch |err| {
         std.debug.print("Error flushing page: {s}\n", .{@errorName(err)});
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
 
-    std.debug.print("Successfully inserted row {d}\n", .{row_to_insert.id});
     return ExecuteResult.EXECUTE_SUCCESS;
 }
 
@@ -897,7 +873,7 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
     const cursor = tableStart(table, allocator) catch {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
-    defer allocator.destroy(cursor); // 确保在函数结束时释放 cursor 内存
+    defer allocator.destroy(cursor);
 
     var row = Row{
         .id = 0,
@@ -906,12 +882,9 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
         .email = undefined,
     };
 
-    // Get stdout for printing
     const stdout = std.io.getStdOut().writer();
 
-    // Only show rows up to the tracked num_rows value - this is critical
-    // to avoid showing garbage data
-    while (cursor.row_num < table.num_rows) {
+    while (!cursor.end_of_table) {
         const value = cursorValue(cursor, allocator) orelse {
             cursorAdvance(cursor);
             continue;
@@ -919,25 +892,22 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
 
         deserializeRow(value, &row);
 
-        // If we encounter a row without the magic number, skip it
         if (row.magic != MAGIC_VALID_ROW) {
             cursorAdvance(cursor);
             continue;
         }
 
-        // Find the actual length of the username (stop at first null byte)
+        // 打印行数据
         var username_len: usize = 0;
         while (username_len < row.username.len and row.username[username_len] != 0) {
             username_len += 1;
         }
 
-        // Find the actual length of the email (stop at first null byte)
         var email_len: usize = 0;
         while (email_len < row.email.len and row.email[email_len] != 0) {
             email_len += 1;
         }
 
-        // Print only the actual content, not the null padding
         stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
         cursorAdvance(cursor);
     }
