@@ -751,6 +751,18 @@ fn closeInputBuffer(input_buffer: *InputBuffer, allocator: std.mem.Allocator) vo
     input_buffer.deinit(allocator);
 }
 
+fn printConstants() void {
+    const stdout = std.io.getStdOut().writer();
+
+    stdout.print("Constants:\n", .{}) catch {};
+    stdout.print("ROW_SIZE: {d}\n", .{ROW_SIZE}) catch {};
+    stdout.print("COMMON_NODE_HEADER_SIZE: {d}\n", .{COMMON_NODE_HEADER_SIZE}) catch {};
+    stdout.print("LEAF_NODE_HEADER_SIZE: {d}\n", .{LEAF_NODE_HEADER_SIZE}) catch {};
+    stdout.print("LEAF_NODE_CELL_SIZE: {d}\n", .{LEAF_NODE_CELL_SIZE}) catch {};
+    stdout.print("LEAF_NODE_SPACE_FOR_CELLS: {d}\n", .{LEAF_NODE_SPACE_FOR_CELLS}) catch {};
+    stdout.print("LEAF_NODE_MAX_CELLS: {d}\n", .{LEAF_NODE_MAX_CELLS}) catch {};
+}
+
 fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Allocator) MetaCommandResult {
     const buffer_content = inputBuffer.buffer.?;
     if (std.mem.eql(u8, buffer_content, ".exit")) {
@@ -772,14 +784,7 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
         printLeafNode(node);
         return MetaCommandResult.META_COMMAND_SUCCESS;
     } else if (std.mem.eql(u8, buffer_content, ".constants")) {
-        const stdout = std.io.getStdOut().writer();
-        stdout.print("Constants:\n", .{}) catch {};
-        stdout.print("ROW_SIZE: {d}\n", .{ROW_SIZE}) catch {};
-        stdout.print("COMMON_NODE_HEADER_SIZE: {d}\n", .{COMMON_NODE_HEADER_SIZE}) catch {};
-        stdout.print("LEAF_NODE_HEADER_SIZE: {d}\n", .{LEAF_NODE_HEADER_SIZE}) catch {};
-        stdout.print("LEAF_NODE_CELL_SIZE: {d}\n", .{LEAF_NODE_CELL_SIZE}) catch {};
-        stdout.print("LEAF_NODE_SPACE_FOR_CELLS: {d}\n", .{LEAF_NODE_SPACE_FOR_CELLS}) catch {};
-        stdout.print("LEAF_NODE_MAX_CELLS: {d}\n", .{LEAF_NODE_MAX_CELLS}) catch {};
+        printConstants();
         return MetaCommandResult.META_COMMAND_SUCCESS;
     } else {
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
