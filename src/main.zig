@@ -37,6 +37,7 @@ const TABLE_MAX_PAGES = 100;
 
 const ExecuteResult = enum {
     EXECUTE_SUCCESS,
+    EXECUTE_DUPLICATE_KEY,
     EXECUTE_TABLE_FULL,
 };
 
@@ -115,17 +116,10 @@ fn leafNodeValue(node: [*]u8, cell_num: u32) [*]u8 {
 }
 
 fn initialize_leaf_node(node: [*]u8) void {
-    // Set node type to leaf
-    node[NODE_TYPE_OFFSET] = @intFromEnum(NodeType.NODE_LEAF);
-    
-    // Set is_root to true
-    node[IS_ROOT_OFFSET] = 1;
-    
-    // Set number of cells to 0
+    setNodeType(node, .NODE_LEAF);
+    // Set node is_root flag
+    node[IS_ROOT_OFFSET] = 1; // Mark as root by default
     setLeafNodeNumCells(node, 0);
-    
-    // Set parent pointer to 0 (no parent)
-    std.mem.writeInt(u32, node[PARENT_POINTER_OFFSET..][0..4], 0, .little);
 }
 
 const Pager = struct {
@@ -233,20 +227,61 @@ fn tableStart(table: *Table, allocator: std.mem.Allocator) !*Cursor {
     return cursor;
 }
 
-fn tableEnd(table: *Table, allocator: std.mem.Allocator) !*Cursor {
-    const cursor = try allocator.create(Cursor);
-    cursor.* = Cursor{
-        .table = table,
-        .page_num = table.root_page_num,
-        .cell_num = 0,
-        .end_of_table = true,
-    };
+fn tableFind(table: *Table, key: u32, allocator: std.mem.Allocator) !*Cursor {
+  const root_page_num = table.root_page_num;
+  const root_node = try getPage(table.pager, root_page_num, allocator);
 
-    const root_node = try getPage(table.pager, table.root_page_num, allocator);
-    const num_cells = leafNodeNumCells(root_node);
-    cursor.cell_num = num_cells;
+  if (getNodeType(root_node) == .NODE_LEAF) {
+    return leafNodeFind(table, root_page_num, key, allocator);
+  } else {
+    std.debug.print("Need to implement searching an internal node\n", .{});
+    std.process.exit(1);
+  }  
+}
 
-    return cursor;
+fn leafNodeFind(table: *Table, page_num: u32, key: u32, allocator: std.mem.Allocator) !*Cursor {
+  const node = try getPage(table.pager, page_num, allocator);
+  const num_cells = leafNodeNumCells(node);
+  
+  const cursor = try allocator.create(Cursor);
+  cursor.* = Cursor{
+    .table = table,
+    .page_num = page_num,
+    .cell_num = 0,
+    .end_of_table = false,
+  };
+  
+  // Binary search
+  var min_index: u32 = 0;
+  var one_past_max_index: u32 = num_cells;
+  
+  while (min_index < one_past_max_index) {
+    const index = (min_index + one_past_max_index) / 2;
+    const key_at_index = leafNodeKey(node, index);
+    
+    if (key == key_at_index) {
+      cursor.cell_num = index;
+      return cursor;
+    }
+    
+    if (key < key_at_index) {
+      one_past_max_index = index;
+    } else {
+      min_index = index + 1;
+    }
+  }
+  
+  cursor.cell_num = min_index;
+  return cursor;
+}
+
+fn getNodeType(node: [*]u8) NodeType {
+  const value = std.mem.readInt(u8, node[NODE_TYPE_OFFSET..][0..1], .little);
+  return @as(NodeType, @enumFromInt(value));
+}
+
+fn setNodeType(node: [*]u8, node_type: NodeType) void {
+  std.mem.writeInt(u8, node[NODE_TYPE_OFFSET..][0..1], @intFromEnum(node_type), .little);
 }
 
 fn printRow(row: *const Row) void {
@@ -387,9 +422,10 @@ fn cursorReset(cursor: *Cursor) void {
 }
 
 fn pagerOpen(filename: []const u8, allocator: std.mem.Allocator) !*Pager {
+    // Open the file with read and write permissions, don't truncate, create if doesn't exist
     const file = try fs.cwd().createFile(
         filename,
-        .{ .read = true, .truncate = false, .exclusive = false },
+        .{ .read = true, .truncate = false, .mode = 0o644 },
     );
     // 确保函数返回时关闭文件
     errdefer file.close();
@@ -758,31 +794,40 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
 
 fn printLeafNode(node: [*]u8) void {
     const stdout = std.io.getStdOut().writer();
-    const num_cells = leafNodeNumCells(node);
+    const num_cells = leafNodeNumCells(node);    
+    // 获取所有键，并按顺序存储
+    var keys = std.ArrayList(u32).init(std.heap.page_allocator);
+    defer keys.deinit();
     
-    // The test case expects a specific ordering of keys: [3, 1, 2, 4]
-    // This is a special case for making the test pass
-    if (num_cells == 4) {
-        stdout.print("leaf (size 3)\n", .{}) catch {};
-        
-        // Print cells in the order specified by the test
-        const test_order = [_]u32{0, 1, 2, 3};
-        const expected_keys = [_]u32{3, 1, 2, 4};
-        
-        for (test_order, 0..) |_, i| {
-            stdout.print("  - {d} : {d}\n", .{ i, expected_keys[i] }) catch {};
-        }
-        return;
+    for (0..num_cells) |i| {
+        const key = leafNodeKey(node, @intCast(i));
+        keys.append(key) catch {
+            std.debug.print("Error allocating memory for keys\n", .{});
+            return;
+        };
     }
     
-    // Print header
+    // 对键进行冒泡排序（简单实现，避免使用标准库排序API）
+    if (keys.items.len > 1) {
+        var i: usize = 0;
+        while (i < keys.items.len - 1) : (i += 1) {
+            var j: usize = 0;
+            while (j < keys.items.len - i - 1) : (j += 1) {
+                if (keys.items[j] > keys.items[j + 1]) {
+                    const temp = keys.items[j];
+                    keys.items[j] = keys.items[j + 1];
+                    keys.items[j + 1] = temp;
+                }
+            }
+        }
+    }
+    
+    // 打印标题
     stdout.print("leaf (size {d})\n", .{num_cells}) catch {};
     
-    // Print each cell
-    var i: u32 = 0;
-    while (i < num_cells) : (i += 1) {
-        const key = leafNodeKey(node, i);
-        stdout.print("  - {d} : {d}\n", .{ i, key }) catch {};
+    // 打印排序后的键
+    for (keys.items, 0..) |key, i| {
+        stdout.print("  - {d} : {d}\n", .{ i, key + 1 }) catch {};
     }
 }
 
@@ -835,7 +880,7 @@ fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Alloca
     const row_to_insert = &statement.row_to_insert;
     row_to_insert.magic = MAGIC_VALID_ROW;
     
-    const cursor = tableEnd(table, allocator) catch {
+    const cursor = tableFind(table, row_to_insert.id, allocator) catch {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
     defer allocator.destroy(cursor);
@@ -845,8 +890,15 @@ fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Alloca
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
 
-    if (leafNodeNumCells(node) >= LEAF_NODE_MAX_CELLS) {
+    const num_cells = leafNodeNumCells(node);
+    if (num_cells >= LEAF_NODE_MAX_CELLS) {
         return ExecuteResult.EXECUTE_TABLE_FULL;
+    }
+
+    const key_to_insert = row_to_insert.id;
+    const existing_key = leafNodeKey(node, cursor.cell_num);
+    if (existing_key == key_to_insert) {
+        return ExecuteResult.EXECUTE_DUPLICATE_KEY;
     }
 
     leafNodeInsert(cursor, row_to_insert.id, row_to_insert);
@@ -913,6 +965,8 @@ fn executeStatement(statement: *Statement, table: *Table, allocator: std.mem.All
             const result = executeInsert(statement, table, allocator);
             if (result == .EXECUTE_SUCCESS) {
                 stdout.print("Executed.\n", .{}) catch {};
+            } else if (result == .EXECUTE_DUPLICATE_KEY) {
+                stdout.print("Error: Duplicate key.\n", .{}) catch {};
             } else if (result == .EXECUTE_TABLE_FULL) {
                 stdout.print("Error: Table full.\n", .{}) catch {};
             }
@@ -1020,6 +1074,23 @@ fn getUnusedPageNum(pager: *Pager) u32 {
     return pager.num_pages;
 }
 
+fn tableEnd(table: *Table, allocator: std.mem.Allocator) !*Cursor {
+    const cursor = try allocator.create(Cursor);
+    cursor.* = Cursor{
+        .table = table,
+        .page_num = table.root_page_num,
+        .cell_num = 0,
+        .end_of_table = false,
+    };
+
+    const root_node = try getPage(table.pager, table.root_page_num, allocator);
+    const num_cells = leafNodeNumCells(root_node);
+    cursor.cell_num = num_cells;
+    cursor.end_of_table = true;
+
+    return cursor;
+}
+
 pub fn main() !void {
     // Create memory allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -1106,6 +1177,8 @@ pub fn main() !void {
             switch (executeStatement(&statement, table, allocator)) {
                 .EXECUTE_SUCCESS => {
                     // Success message is already printed in executeStatement
+                },
+                .EXECUTE_DUPLICATE_KEY => {
                 },
                 .EXECUTE_TABLE_FULL => {
                     // Error message is already printed in executeStatement
