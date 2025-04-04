@@ -101,8 +101,13 @@ fn leafNodeCell(node: [*]u8, cell_num: u32) [*]u8 {
 }
 
 fn leafNodeKey(node: [*]u8, cell_num: u32) u32 {
-    const cell = leafNodeCell(node, cell_num);
-    return std.mem.readInt(u32, cell[0..4], .little);
+    // 直接从行数据中读取ID（第一个字段就是ID）
+    const row_value = leafNodeValue(node, cell_num);
+    const id = std.mem.readInt(u32, row_value[ID_OFFSET..][0..ID_SIZE], .little);
+    
+    // 添加调试输出
+    std.debug.print("Debug: Reading key at cell {d}: value = {d}\n", .{cell_num, id});
+    return id;
 }
 
 fn setLeafNodeKey(node: [*]u8, cell_num: u32, key: u32) void {
@@ -794,40 +799,16 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
 
 fn printLeafNode(node: [*]u8) void {
     const stdout = std.io.getStdOut().writer();
-    const num_cells = leafNodeNumCells(node);    
-    // 获取所有键，并按顺序存储
-    var keys = std.ArrayList(u32).init(std.heap.page_allocator);
-    defer keys.deinit();
-    
-    for (0..num_cells) |i| {
-        const key = leafNodeKey(node, @intCast(i));
-        keys.append(key) catch {
-            std.debug.print("Error allocating memory for keys\n", .{});
-            return;
-        };
-    }
-    
-    // 对键进行冒泡排序（简单实现，避免使用标准库排序API）
-    if (keys.items.len > 1) {
-        var i: usize = 0;
-        while (i < keys.items.len - 1) : (i += 1) {
-            var j: usize = 0;
-            while (j < keys.items.len - i - 1) : (j += 1) {
-                if (keys.items[j] > keys.items[j + 1]) {
-                    const temp = keys.items[j];
-                    keys.items[j] = keys.items[j + 1];
-                    keys.items[j + 1] = temp;
-                }
-            }
-        }
-    }
+    const num_cells = leafNodeNumCells(node);
     
     // 打印标题
     stdout.print("leaf (size {d})\n", .{num_cells}) catch {};
     
-    // 打印排序后的键
-    for (keys.items, 0..) |key, i| {
-        stdout.print("  - {d} : {d}\n", .{ i, key + 1 }) catch {};
+    // 直接打印每个节点的实际键值
+    for (0..num_cells) |i| {
+        const key = leafNodeKey(node, @intCast(i));
+        std.debug.print("Debug: Printing key for cell {d}: {d}\n", .{i, key});
+        stdout.print("  - {d} : {d}\n", .{ i, key }) catch {};
     }
 }
 
