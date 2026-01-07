@@ -104,9 +104,9 @@ fn leafNodeKey(node: [*]u8, cell_num: u32) u32 {
     // 直接从行数据中读取ID（第一个字段就是ID）
     const row_value = leafNodeValue(node, cell_num);
     const id = std.mem.readInt(u32, row_value[ID_OFFSET..][0..ID_SIZE], .little);
-    
+
     // 添加调试输出
-    std.debug.print("Debug: Reading key at cell {d}: value = {d}\n", .{cell_num, id});
+    std.debug.print("Debug: Reading key at cell {d}: value = {d}\n", .{ cell_num, id });
     return id;
 }
 
@@ -233,64 +233,66 @@ fn tableStart(table: *Table, allocator: std.mem.Allocator) !*Cursor {
 }
 
 fn tableFind(table: *Table, key: u32, allocator: std.mem.Allocator) !*Cursor {
-  const root_page_num = table.root_page_num;
-  const root_node = try getPage(table.pager, root_page_num, allocator);
+    const root_page_num = table.root_page_num;
+    const root_node = try getPage(table.pager, root_page_num, allocator);
 
-  if (getNodeType(root_node) == .NODE_LEAF) {
-    return leafNodeFind(table, root_page_num, key, allocator);
-  } else {
-    std.debug.print("Need to implement searching an internal node\n", .{});
-    std.process.exit(1);
-  }  
+    if (getNodeType(root_node) == .NODE_LEAF) {
+        return leafNodeFind(table, root_page_num, key, allocator);
+    } else {
+        std.debug.print("Need to implement searching an internal node\n", .{});
+        std.process.exit(1);
+    }
 }
 
 fn leafNodeFind(table: *Table, page_num: u32, key: u32, allocator: std.mem.Allocator) !*Cursor {
-  const node = try getPage(table.pager, page_num, allocator);
-  const num_cells = leafNodeNumCells(node);
-  
-  const cursor = try allocator.create(Cursor);
-  cursor.* = Cursor{
-    .table = table,
-    .page_num = page_num,
-    .cell_num = 0,
-    .end_of_table = false,
-  };
-  
-  // Binary search
-  var min_index: u32 = 0;
-  var one_past_max_index: u32 = num_cells;
-  
-  while (min_index < one_past_max_index) {
-    const index = (min_index + one_past_max_index) / 2;
-    const key_at_index = leafNodeKey(node, index);
-    
-    if (key == key_at_index) {
-      cursor.cell_num = index;
-      return cursor;
+    const node = try getPage(table.pager, page_num, allocator);
+    const num_cells = leafNodeNumCells(node);
+
+    const cursor = try allocator.create(Cursor);
+    cursor.* = Cursor{
+        .table = table,
+        .page_num = page_num,
+        .cell_num = 0,
+        .end_of_table = false,
+    };
+
+    // Binary search
+    var min_index: u32 = 0;
+    var one_past_max_index: u32 = num_cells;
+
+    while (min_index < one_past_max_index) {
+        const index = (min_index + one_past_max_index) / 2;
+        const key_at_index = leafNodeKey(node, index);
+
+        if (key == key_at_index) {
+            cursor.cell_num = index;
+            return cursor;
+        }
+
+        if (key < key_at_index) {
+            one_past_max_index = index;
+        } else {
+            min_index = index + 1;
+        }
     }
-    
-    if (key < key_at_index) {
-      one_past_max_index = index;
-    } else {
-      min_index = index + 1;
-    }
-  }
-  
-  cursor.cell_num = min_index;
-  return cursor;
+
+    cursor.cell_num = min_index;
+    return cursor;
 }
 
 fn getNodeType(node: [*]u8) NodeType {
-  const value = std.mem.readInt(u8, node[NODE_TYPE_OFFSET..][0..1], .little);
-  return @as(NodeType, @enumFromInt(value));
+    const value = std.mem.readInt(u8, node[NODE_TYPE_OFFSET..][0..1], .little);
+    return @as(NodeType, @enumFromInt(value));
 }
 
 fn setNodeType(node: [*]u8, node_type: NodeType) void {
-  std.mem.writeInt(u8, node[NODE_TYPE_OFFSET..][0..1], @intFromEnum(node_type), .little);
+    std.mem.writeInt(u8, node[NODE_TYPE_OFFSET..][0..1], @intFromEnum(node_type), .little);
 }
 
 fn printRow(row: *const Row) void {
-    const stdout = std.io.getStdOut().writer();
+    var buffer: [512]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &writer.interface;
 
     // Find the actual length of the username (stop at first null byte)
     var username_len: usize = 0;
@@ -307,6 +309,7 @@ fn printRow(row: *const Row) void {
     // Print only the actual content, not the null padding
     // Add a newline at the end
     stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
+    stdout.flush() catch {};
 }
 
 fn leafNodeInsert(cursor: *Cursor, key: u32, value: *Row) void {
@@ -523,7 +526,7 @@ fn getPage(pager: *Pager, page_num: u32, allocator: std.mem.Allocator) ![*]u8 {
 
 pub fn dbClose(table: *Table, allocator: std.mem.Allocator) !void {
     var pager = table.pager;
-    
+
     // 将所有完整的页面写入磁盘并释放内存
     for (0..table.pager.num_pages) |i| {
         const page_num: u32 = @intCast(i);
@@ -581,7 +584,7 @@ fn pagerFlush(pager: *Pager, page_num: u32) !void {
     const num_cells = leafNodeNumCells(node);
     std.debug.print("Number of cells: {d}\n", .{num_cells});
     std.debug.print("Node type: {d}, is_root: {d}\n", .{ node[NODE_TYPE_OFFSET], node[IS_ROOT_OFFSET] });
-    
+
     // Print raw data for debugging
     std.debug.print("Debug: Raw page data:\n", .{});
     for (0..PAGE_SIZE) |i| {
@@ -619,13 +622,13 @@ fn dbOpen(filename: []const u8, allocator: std.mem.Allocator) !*Table {
         const root_node = try getPage(pager, 0, allocator);
         const num_cells = leafNodeNumCells(root_node);
         std.debug.print("Opened existing database with {d} rows\n", .{num_cells});
-        
+
         // Verify root node validity
         if (root_node[NODE_TYPE_OFFSET] != @intFromEnum(NodeType.NODE_LEAF)) {
             std.debug.print("Error: Root node is not a leaf node\n", .{});
             return error.InvalidNodeType;
         }
-        
+
         // Verify that the root node is marked as root
         if (root_node[IS_ROOT_OFFSET] != 1) {
             std.debug.print("Error: Root node is not marked as root\n", .{});
@@ -687,13 +690,18 @@ fn freeTable(table: *Table, allocator: std.mem.Allocator) void {
 
 // Print prompt
 fn printPrompt() void {
-    const stdout = std.io.getStdOut().writer();
+    var buffer: [256]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &writer.interface;
     stdout.print("db > ", .{}) catch {};
+    stdout.flush() catch {};
 }
 
 // Read input
 fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
-    var stdin = std.io.getStdIn().reader();
+    var read_buffer: [512]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(&read_buffer);
+    const stdin = &stdin_reader.interface;
 
     // Free existing buffer if exists
     if (input_buffer.buffer) |buf| {
@@ -704,7 +712,7 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
     var buffer = try allocator.alloc(u8, 400);
     errdefer allocator.free(buffer);
 
-    const line = stdin.readUntilDelimiterOrEof(buffer, '\n') catch |err| {
+    const line = stdin.takeDelimiterExclusive('\n') catch |err| {
         // Free the buffer on error
         allocator.free(buffer);
         input_buffer.buffer = null;
@@ -713,43 +721,27 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
 
         if (err == error.EndOfStream) {
             // Handle EOF gracefully - exit the program
-            const stdout = std.io.getStdOut().writer();
+            var stdout_buffer: [256]u8 = undefined;
+            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            const stdout = &stdout_writer.interface;
             stdout.print("\n", .{}) catch {};
+            stdout.flush() catch {};
             std.process.exit(0);
         }
 
         return err;
     };
 
-    // Handle EOF
-    if (line == null) {
-        // Free the buffer and exit gracefully on EOF
-        allocator.free(buffer);
-        input_buffer.buffer = null;
-        input_buffer.buffer_length = 0;
-        input_buffer.input_length = 0;
+    // Toss the delimiter
+    stdin.toss(1);
 
-        const stdout = std.io.getStdOut().writer();
-        stdout.print("\n", .{}) catch {};
-        std.process.exit(0);
-    }
-
-    // Resize buffer to actual read size
-    if (line.?.len < buffer.len) {
-        const resized = allocator.resize(buffer, line.?.len);
-        if (resized) {
-            buffer = buffer[0..line.?.len];
-        } else {
-            const new_buffer = try allocator.alloc(u8, line.?.len);
-            @memcpy(new_buffer, line.?);
-            allocator.free(buffer);
-            buffer = new_buffer;
-        }
-    }
+    // Copy line data to buffer
+    const len = @min(line.len, buffer.len);
+    @memcpy(buffer[0..len], line[0..len]);
 
     input_buffer.buffer = buffer;
-    input_buffer.buffer_length = buffer.len;
-    input_buffer.input_length = @intCast(buffer.len);
+    input_buffer.buffer_length = len;
+    input_buffer.input_length = @intCast(len);
 }
 
 // Close input buffer
@@ -758,7 +750,9 @@ fn closeInputBuffer(input_buffer: *InputBuffer, allocator: std.mem.Allocator) vo
 }
 
 fn printConstants() void {
-    const stdout = std.io.getStdOut().writer();
+    var buffer: [512]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &writer.interface;
 
     stdout.print("Constants:\n", .{}) catch {};
     stdout.print("ROW_SIZE: {d}\n", .{ROW_SIZE}) catch {};
@@ -767,6 +761,7 @@ fn printConstants() void {
     stdout.print("LEAF_NODE_CELL_SIZE: {d}\n", .{LEAF_NODE_CELL_SIZE}) catch {};
     stdout.print("LEAF_NODE_SPACE_FOR_CELLS: {d}\n", .{LEAF_NODE_SPACE_FOR_CELLS}) catch {};
     stdout.print("LEAF_NODE_MAX_CELLS: {d}\n", .{LEAF_NODE_MAX_CELLS}) catch {};
+    stdout.flush() catch {};
 }
 
 fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Allocator) MetaCommandResult {
@@ -781,12 +776,16 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
 
         std.process.exit(0);
     } else if (std.mem.eql(u8, buffer_content, ".btree")) {
-        const stdout = std.io.getStdOut().writer();
+        var stdout_buffer: [512]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        const stdout = &stdout_writer.interface;
         stdout.print("Tree:\n", .{}) catch {};
+        stdout.flush() catch {};
         const node = getPage(table.pager, 0, allocator) catch |err| {
             std.debug.print("Error getting page: {s}\n", .{@errorName(err)});
             return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND;
         };
+
         printLeafNode(node);
         return MetaCommandResult.META_COMMAND_SUCCESS;
     } else if (std.mem.eql(u8, buffer_content, ".constants")) {
@@ -798,18 +797,21 @@ fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Al
 }
 
 fn printLeafNode(node: [*]u8) void {
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
     const num_cells = leafNodeNumCells(node);
-    
+
     // 打印标题
     stdout.print("leaf (size {d})\n", .{num_cells}) catch {};
-    
+
     // 直接打印每个节点的实际键值
     for (0..num_cells) |i| {
         const key = leafNodeKey(node, @intCast(i));
-        std.debug.print("Debug: Printing key for cell {d}: {d}\n", .{i, key});
+        std.debug.print("Debug: Printing key for cell {d}: {d}\n", .{ i, key });
         stdout.print("  - {d} : {d}\n", .{ i, key }) catch {};
     }
+    stdout.flush() catch {};
 }
 
 fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareResult {
@@ -860,7 +862,7 @@ fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareRes
 fn executeInsert(statement: *Statement, table: *Table, allocator: std.mem.Allocator) ExecuteResult {
     const row_to_insert = &statement.row_to_insert;
     row_to_insert.magic = MAGIC_VALID_ROW;
-    
+
     const cursor = tableFind(table, row_to_insert.id, allocator) catch {
         return ExecuteResult.EXECUTE_TABLE_FULL;
     };
@@ -905,7 +907,9 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
         .email = undefined,
     };
 
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
     while (!cursor.end_of_table) {
         const value = cursorValue(cursor, allocator) orelse {
@@ -934,12 +938,15 @@ fn executeSelect(_: *Statement, table: *Table, allocator: std.mem.Allocator) Exe
         stdout.print("({d}, {s}, {s})\n", .{ row.id, row.username[0..username_len], row.email[0..email_len] }) catch {};
         cursorAdvance(cursor);
     }
+    stdout.flush() catch {};
 
     return ExecuteResult.EXECUTE_SUCCESS;
 }
 
 fn executeStatement(statement: *Statement, table: *Table, allocator: std.mem.Allocator) ExecuteResult {
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
     switch (statement.type) {
         .STATEMENT_INSERT => {
@@ -951,6 +958,7 @@ fn executeStatement(statement: *Statement, table: *Table, allocator: std.mem.All
             } else if (result == .EXECUTE_TABLE_FULL) {
                 stdout.print("Error: Table full.\n", .{}) catch {};
             }
+            stdout.flush() catch {};
             return result;
         },
         .STATEMENT_SELECT => {
@@ -958,6 +966,7 @@ fn executeStatement(statement: *Statement, table: *Table, allocator: std.mem.All
             if (result == .EXECUTE_SUCCESS) {
                 stdout.print("Executed.\n", .{}) catch {};
             }
+            stdout.flush() catch {};
             return result;
         },
     }
@@ -969,35 +978,35 @@ fn leafNodeSplitAndInsert(cursor: *Cursor, key: u32, value: *Row) void {
         std.debug.print("Failed to get old page in split\n", .{});
         return;
     };
-    
+
     // Create a new node
     const new_page_num = getUnusedPageNum(cursor.table.pager);
     const new_node = getPage(cursor.table.pager, new_page_num, cursor.table.pager.allocator) catch {
         std.debug.print("Failed to get new page in split\n", .{});
         return;
     };
-    
+
     // Initialize the new node
     initialize_leaf_node(new_node);
-    
+
     // For now, just insert the row directly into the new node
     // In a real B-tree implementation, we would split the cells between the nodes
-    
+
     // Set cursor to new node
     cursor.page_num = new_page_num;
     cursor.cell_num = 0;
-    
+
     // Insert directly using standard insertion
     // Write key
     setLeafNodeKey(new_node, 0, key);
-    
+
     // Serialize row data into value part of node
     serializeRow(value, leafNodeValue(new_node, 0));
-    
+
     // Update number of cells
     setLeafNodeNumCells(new_node, 1);
-    
-    std.debug.print("Split: Inserted key {} into new node {}\n", .{key, new_page_num});
+
+    std.debug.print("Split: Inserted key {} into new node {}\n", .{ key, new_page_num });
 }
 
 fn leafNodeGetMaxKey(node: [*]u8) u32 {
@@ -1035,7 +1044,7 @@ fn internalNodeChild(node: [*]u8, child_num: u32) [*]u8 {
 fn leafNodeFindChild(node: [*]u8, key: u32) u32 {
     const num_cells = leafNodeNumCells(node);
     std.debug.print("Debug: Finding child for key: {}, num_cells: {}\n", .{ key, num_cells });
-    
+
     // Find the correct position to insert the key
     var i: u32 = 0;
     while (i < num_cells) : (i += 1) {
@@ -1045,7 +1054,7 @@ fn leafNodeFindChild(node: [*]u8, key: u32) u32 {
             return i;
         }
     }
-    
+
     // If we get here, insert at the end
     std.debug.print("Debug: Inserting at end (index: {})\n", .{num_cells});
     return num_cells;
@@ -1107,13 +1116,18 @@ pub fn main() !void {
         try readInput(input_buffer, allocator);
 
         if (input_buffer.buffer) |buffer_content| {
+            // Create stdout writer for error messages
+            var stdout_buffer: [512]u8 = undefined;
+            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            const stdout = &stdout_writer.interface;
+
             // Check if it's a meta command
             if (buffer_content.len > 0 and buffer_content[0] == '.') {
                 switch (doMetaCommand(input_buffer, table, allocator)) {
                     .META_COMMAND_SUCCESS => continue,
                     .META_COMMAND_UNRECOGNIZED_COMMAND => {
-                        const stdout = std.io.getStdOut().writer();
                         stdout.print("Unrecognized command '{s}'\n", .{buffer_content}) catch {};
+                        stdout.flush() catch {};
                         continue;
                     },
                 }
@@ -1133,23 +1147,23 @@ pub fn main() !void {
             switch (prepareStatement(input_buffer, &statement)) {
                 .PREPARE_SUCCESS => {},
                 .PREPARE_NEGATIVE_ID => {
-                    const stdout = std.io.getStdOut().writer();
                     stdout.print("ID must be positive.\n", .{}) catch {};
+                    stdout.flush() catch {};
                     continue;
                 },
                 .PREPARE_SYNTAX_ERROR => {
-                    const stdout = std.io.getStdOut().writer();
                     stdout.print("Syntax error. Could not parse statement.\n", .{}) catch {};
+                    stdout.flush() catch {};
                     continue;
                 },
                 .PREPARE_UNRECOGNIZED_STATEMENT => {
-                    const stdout = std.io.getStdOut().writer();
                     stdout.print("Unrecognized keyword at start of '{s}'\n", .{buffer_content}) catch {};
+                    stdout.flush() catch {};
                     continue;
                 },
                 .PREPARE_STRING_TOO_LONG => {
-                    const stdout = std.io.getStdOut().writer();
                     stdout.print("String is too long.\n", .{}) catch {};
+                    stdout.flush() catch {};
                     continue;
                 },
             }
@@ -1159,8 +1173,7 @@ pub fn main() !void {
                 .EXECUTE_SUCCESS => {
                     // Success message is already printed in executeStatement
                 },
-                .EXECUTE_DUPLICATE_KEY => {
-                },
+                .EXECUTE_DUPLICATE_KEY => {},
                 .EXECUTE_TABLE_FULL => {
                     // Error message is already printed in executeStatement
                 },
