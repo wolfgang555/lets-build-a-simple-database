@@ -698,11 +698,8 @@ fn printPrompt() void {
 }
 
 // Read input
-fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
-    var read_buffer: [512]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&read_buffer);
-    const stdin = &stdin_reader.interface;
-
+// Read input
+fn readInput(stdin: anytype, input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
     // Free existing buffer if exists
     if (input_buffer.buffer) |buf| {
         allocator.free(buf);
@@ -739,7 +736,7 @@ fn readInput(input_buffer: *InputBuffer, allocator: std.mem.Allocator) !void {
     const len = @min(line.len, buffer.len);
     @memcpy(buffer[0..len], line[0..len]);
 
-    input_buffer.buffer = buffer;
+    input_buffer.buffer = buffer;  // Store the full allocation
     input_buffer.buffer_length = len;
     input_buffer.input_length = @intCast(len);
 }
@@ -765,7 +762,8 @@ fn printConstants() void {
 }
 
 fn doMetaCommand(inputBuffer: *InputBuffer, table: *Table, allocator: std.mem.Allocator) MetaCommandResult {
-    const buffer_content = inputBuffer.buffer.?;
+    const full_buffer = inputBuffer.buffer.?;
+    const buffer_content = full_buffer[0..inputBuffer.buffer_length];
     if (std.mem.eql(u8, buffer_content, ".exit")) {
         closeInputBuffer(inputBuffer, allocator);
 
@@ -815,7 +813,8 @@ fn printLeafNode(node: [*]u8) void {
 }
 
 fn prepareStatement(inputBuffer: *InputBuffer, statement: *Statement) PrepareResult {
-    if (inputBuffer.buffer) |buffer_content| {
+    if (inputBuffer.buffer) |full_buffer| {
+        const buffer_content = full_buffer[0..inputBuffer.buffer_length];
         if (buffer_content.len >= 6 and std.mem.eql(u8, buffer_content[0..6], "insert")) {
             statement.*.type = .STATEMENT_INSERT;
 
@@ -1111,11 +1110,16 @@ pub fn main() !void {
     const input_buffer = try InputBuffer.new(allocator);
     defer input_buffer.deinit(allocator);
 
+    var stdin_buffer: [512]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+    const stdin = &stdin_reader.interface;
+
     while (true) {
         printPrompt();
-        try readInput(input_buffer, allocator);
+        try readInput(stdin, input_buffer, allocator);
 
-        if (input_buffer.buffer) |buffer_content| {
+        if (input_buffer.buffer) |full_buffer| {
+            const buffer_content = full_buffer[0..input_buffer.buffer_length];
             // Create stdout writer for error messages
             var stdout_buffer: [512]u8 = undefined;
             var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
